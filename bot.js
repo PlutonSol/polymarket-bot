@@ -84,7 +84,36 @@ function removeWallet(addressOrIndex) {
 // ============================================
 // CLOB CLIENT INIT
 // ============================================
-async function initClobClient(privateKey, funderAddr) {
+
+// Methode 1: Via API Key directe (key + secret + passphrase)
+async function initClobWithApiKey(apiKey, apiSecret, apiPassphrase, privateKey, funderAddr) {
+    try {
+        const signer = new Wallet(privateKey);
+        traderPrivateKey = privateKey;
+        traderFunderAddress = funderAddr || signer.address;
+
+        const creds = { key: apiKey, secret: apiSecret, passphrase: apiPassphrase };
+
+        clobClient = new ClobClient(
+            CONFIG.CLOB_HOST,
+            CONFIG.CHAIN_ID,
+            signer,
+            creds,
+            signatureType,
+            traderFunderAddress
+        );
+
+        console.log('✅ CLOB Client initialisé (API Key)');
+        return true;
+    } catch (e) {
+        console.error('❌ Erreur init CLOB (API Key):', e.message);
+        clobClient = null;
+        return false;
+    }
+}
+
+// Methode 2: Via Private Key seule (derive les credentials)
+async function initClobWithPrivateKey(privateKey, funderAddr) {
     try {
         const signer = new Wallet(privateKey);
         traderPrivateKey = privateKey;
@@ -102,7 +131,7 @@ async function initClobClient(privateKey, funderAddr) {
             traderFunderAddress
         );
 
-        console.log('✅ CLOB Client initialisé');
+        console.log('✅ CLOB Client initialisé (Private Key)');
         return true;
     } catch (e) {
         console.error('❌ Erreur init CLOB:', e.message);
@@ -201,10 +230,19 @@ async function init() {
 
     loadWalletsFromEnv();
 
-    // Auto-init CLOB si cle privee dans env
-    if (process.env.POLYMARKET_PRIVATE_KEY) {
-        const ok = await initClobClient(process.env.POLYMARKET_PRIVATE_KEY, traderFunderAddress);
-        if (ok) console.log('🔑 Clé privée chargée depuis env');
+    // Auto-init CLOB: API Key prioritaire, sinon Private Key
+    if (process.env.POLY_API_KEY && process.env.POLY_API_SECRET && process.env.POLY_API_PASSPHRASE && process.env.POLYMARKET_PRIVATE_KEY) {
+        const ok = await initClobWithApiKey(
+            process.env.POLY_API_KEY,
+            process.env.POLY_API_SECRET,
+            process.env.POLY_API_PASSPHRASE,
+            process.env.POLYMARKET_PRIVATE_KEY,
+            traderFunderAddress
+        );
+        if (ok) console.log('🔑 API Key + Private Key chargées depuis env');
+    } else if (process.env.POLYMARKET_PRIVATE_KEY) {
+        const ok = await initClobWithPrivateKey(process.env.POLYMARKET_PRIVATE_KEY, traderFunderAddress);
+        if (ok) console.log('🔑 Private Key chargée depuis env (credentials dérivées)');
     }
 
     telegramBot = new TelegramBot(CONFIG.TELEGRAM_BOT_TOKEN, { polling: true });
@@ -222,6 +260,7 @@ _Railway Edition_
 /wallets - Liste
 
 📋 *Copy-Trading:*
+/setapi \\<key\\> \\<secret\\> \\<pass\\> - API Key
 /setkey \\<clé\\> - Clé privée
 /setfunder \\<adresse\\> - Adresse funder
 /copytrading - On/Off
@@ -255,7 +294,30 @@ _Pour persister: var env WALLETS sur Railway_`);
 // ============================================
 function setupTelegramCommands() {
 
-    // --- SET KEY ---
+    // --- SET API KEY (key + secret + passphrase) ---
+    telegramBot.onText(/\/setapi(?:@\S+)?\s+(\S+)\s+(\S+)\s+(\S+)/, async (msg, match) => {
+        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        try { await telegramBot.deleteMessage(msg.chat.id, msg.message_id); } catch (e) {}
+
+        const apiKey = match[1].trim();
+        const apiSecret = match[2].trim();
+        const apiPassphrase = match[3].trim();
+
+        if (!traderPrivateKey) {
+            return await sendTelegram('❌ D\'abord /setkey avec ta clé privée.\nL\'API key seule ne suffit pas (signature requise).\n\n1. /setkey \\<clé privée\\>\n2. /setapi \\<key\\> \\<secret\\> \\<passphrase\\>');
+        }
+
+        await sendTelegram('🔄 Initialisation avec API Key...');
+
+        const ok = await initClobWithApiKey(apiKey, apiSecret, apiPassphrase, traderPrivateKey, traderFunderAddress);
+        if (ok) {
+            await sendTelegram(`✅ *API Key configurée!*\n🔑 Key: \`${apiKey.slice(0, 8)}...\`\n\n⚠️ Message supprimé.\n💡 Sur Railway:\n\`POLY\\_API\\_KEY\`\n\`POLY\\_API\\_SECRET\`\n\`POLY\\_API\\_PASSPHRASE\`\n\nPuis /copytrading pour activer.`);
+        } else {
+            await sendTelegram('❌ Erreur. Vérifiez vos credentials.');
+        }
+    });
+
+    // --- SET PRIVATE KEY ---
     telegramBot.onText(/\/setkey(?:@\S+)?\s+(\S+)/, async (msg, match) => {
         if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
         try { await telegramBot.deleteMessage(msg.chat.id, msg.message_id); } catch (e) {}
@@ -268,10 +330,10 @@ function setupTelegramCommands() {
         const formattedKey = key.startsWith('0x') ? key : '0x' + key;
         await sendTelegram('🔄 Initialisation CLOB...');
 
-        const ok = await initClobClient(formattedKey, traderFunderAddress);
+        const ok = await initClobWithPrivateKey(formattedKey, traderFunderAddress);
         if (ok) {
             const signer = new Wallet(formattedKey);
-            await sendTelegram(`✅ *Clé configurée!*\n🔑 \`${signer.address}\`\n\n⚠️ Message supprimé.\n💡 Persister: ajoutez \`POLYMARKET\\_PRIVATE\\_KEY\` sur Railway\nPuis /copytrading pour activer.`);
+            await sendTelegram(`✅ *Clé configurée!*\n🔑 \`${signer.address}\`\n\n⚠️ Message supprimé.\n💡 Si tu as une API Key Polymarket:\n/setapi \\<key\\> \\<secret\\> \\<passphrase\\>\n\nSinon /copytrading pour activer.`);
         } else {
             await sendTelegram('❌ Erreur init. Vérifiez la clé.');
         }
@@ -284,7 +346,7 @@ function setupTelegramCommands() {
         if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) return await sendTelegram('❌ Adresse invalide.');
 
         traderFunderAddress = addr.toLowerCase();
-        if (traderPrivateKey) await initClobClient(traderPrivateKey, traderFunderAddress);
+        if (traderPrivateKey) await initClobWithPrivateKey(traderPrivateKey, traderFunderAddress);
         await sendTelegram(`✅ Funder: \`${traderFunderAddress}\`\n💡 Persister: \`POLYMARKET\\_FUNDER\\_ADDRESS\` sur Railway`);
     });
 
