@@ -82,6 +82,46 @@ function removeWallet(addressOrIndex) {
 }
 
 // ============================================
+// PROXY WALLET RESOLUTION
+// ============================================
+// Polymarket utilise des proxy wallets (smart contracts) pour le trading.
+// Ton EOA (clé privée) = signer (signe les ordres)
+// Ton proxy wallet = funder (détient les fonds USDC + exécute les trades)
+// Ces adresses sont DIFFÉRENTES ! Le funder DOIT être le proxy wallet.
+
+async function resolveProxyAddress(address) {
+    const addr = address.toLowerCase();
+
+    // Methode 1: Gamma API profiles endpoint
+    try {
+        const res = await fetch(`https://gamma-api.polymarket.com/profiles/${addr}`);
+        if (res.ok) {
+            const data = await res.json();
+            if (data && data.proxyWallet) {
+                return data.proxyWallet.toLowerCase();
+            }
+        }
+    } catch (e) {
+        console.log('Proxy resolve (profiles):', e.message);
+    }
+
+    // Methode 2: Via activity data (si l'adresse a déjà tradé)
+    try {
+        const res = await fetch(`https://data-api.polymarket.com/activity?user=${addr}&limit=1`);
+        if (res.ok) {
+            const data = await res.json();
+            if (Array.isArray(data) && data.length > 0 && data[0].proxyWallet) {
+                return data[0].proxyWallet.toLowerCase();
+            }
+        }
+    } catch (e) {
+        console.log('Proxy resolve (activity):', e.message);
+    }
+
+    return null;
+}
+
+// ============================================
 // CLOB CLIENT INIT
 // ============================================
 
@@ -90,7 +130,22 @@ async function initClobWithApiKey(apiKey, apiSecret, apiPassphrase, privateKey, 
     try {
         const signer = new Wallet(privateKey);
         traderPrivateKey = privateKey;
-        traderFunderAddress = funderAddr || signer.address;
+
+        // Résolution du proxy wallet
+        if (funderAddr) {
+            traderFunderAddress = funderAddr;
+        } else {
+            console.log('🔍 Résolution du proxy wallet...');
+            const proxy = await resolveProxyAddress(signer.address);
+            if (proxy) {
+                traderFunderAddress = proxy;
+                console.log(`✅ Proxy wallet résolu: ${proxy}`);
+            } else {
+                traderFunderAddress = signer.address;
+                console.log('⚠️ Proxy wallet non trouvé - utilisation EOA par défaut');
+                console.log('⚠️ Utilisez /setfunder pour définir votre proxy wallet Polymarket');
+            }
+        }
 
         const creds = { key: apiKey, secret: apiSecret, passphrase: apiPassphrase };
 
@@ -103,7 +158,8 @@ async function initClobWithApiKey(apiKey, apiSecret, apiPassphrase, privateKey, 
             traderFunderAddress
         );
 
-        console.log('✅ CLOB Client initialisé (API Key)');
+        const isProxy = traderFunderAddress !== signer.address.toLowerCase();
+        console.log(`✅ CLOB Client initialisé (API Key) - Funder: ${isProxy ? 'PROXY' : 'EOA'}`);
         return true;
     } catch (e) {
         console.error('❌ Erreur init CLOB (API Key):', e.message);
@@ -117,7 +173,22 @@ async function initClobWithPrivateKey(privateKey, funderAddr) {
     try {
         const signer = new Wallet(privateKey);
         traderPrivateKey = privateKey;
-        traderFunderAddress = funderAddr || signer.address;
+
+        // Résolution du proxy wallet
+        if (funderAddr) {
+            traderFunderAddress = funderAddr;
+        } else {
+            console.log('🔍 Résolution du proxy wallet...');
+            const proxy = await resolveProxyAddress(signer.address);
+            if (proxy) {
+                traderFunderAddress = proxy;
+                console.log(`✅ Proxy wallet résolu: ${proxy}`);
+            } else {
+                traderFunderAddress = signer.address;
+                console.log('⚠️ Proxy wallet non trouvé - utilisation EOA par défaut');
+                console.log('⚠️ Utilisez /setfunder pour définir votre proxy wallet Polymarket');
+            }
+        }
 
         const tempClient = new ClobClient(CONFIG.CLOB_HOST, CONFIG.CHAIN_ID, signer);
         const creds = await tempClient.createOrDeriveApiKey();
@@ -131,7 +202,8 @@ async function initClobWithPrivateKey(privateKey, funderAddr) {
             traderFunderAddress
         );
 
-        console.log('✅ CLOB Client initialisé (Private Key)');
+        const isProxy = traderFunderAddress !== signer.address.toLowerCase();
+        console.log(`✅ CLOB Client initialisé (Private Key) - Funder: ${isProxy ? 'PROXY' : 'EOA'}`);
         return true;
     } catch (e) {
         console.error('❌ Erreur init CLOB:', e.message);
@@ -251,18 +323,29 @@ async function init() {
 
     const copyStatus = clobClient ? '🟢 Prêt' : '🔴 Non configuré';
 
+    let proxyStatus = '';
+    if (traderPrivateKey) {
+        const signer = new Wallet(traderPrivateKey);
+        const isProxy = traderFunderAddress && traderFunderAddress !== signer.address.toLowerCase();
+        proxyStatus = isProxy
+            ? `\n🏠 Proxy: \`${traderFunderAddress.slice(0, 6)}...${traderFunderAddress.slice(-4)}\` ✅`
+            : '\n⚠️ Proxy wallet non détecté - /setfunder requis';
+    }
+
     await sendTelegram(`🤖 *Bot Polymarket Copy-Trader*
 _Railway Edition_
 
-📋 *Wallets:*
+📋 *Wallets surveillés:*
 /add \\<adresse\\> \\<nom\\> - Ajouter
 /remove \\<n° ou adresse\\> - Supprimer
 /wallets - Liste
+/lookup \\<adresse\\> - Trouver proxy wallet
 
 📋 *Copy-Trading:*
-/setapi \\<key\\> \\<secret\\> \\<pass\\> - API Key
 /setkey \\<clé\\> - Clé privée
-/setfunder \\<adresse\\> - Adresse funder
+/setapi \\<key\\> \\<secret\\> \\<pass\\> - API Key
+/setfunder \\<adresse\\> - Proxy wallet Polymarket
+/myaddress - Voir EOA + proxy
 /copytrading - On/Off
 /setmultiplier \\<x\\> - Multiplicateur
 /setmax \\<$\\> - Max par trade
@@ -272,8 +355,12 @@ _Railway Edition_
 /start\\_watch | /stop\\_watch
 /recent | /summary | /status
 
-🔐 Copy-trading: ${copyStatus}
+🔐 Copy-trading: ${copyStatus}${proxyStatus}
 📂 Wallets: ${wallets.length}
+
+💡 _Polymarket utilise des proxy wallets._
+_Ton adresse de trading ≠ ton EOA._
+_Le bot résout automatiquement le proxy._
 
 ⚠️ _/add et /remove sont en mémoire._
 _Pour persister: var env WALLETS sur Railway_`);
@@ -311,7 +398,14 @@ function setupTelegramCommands() {
 
         const ok = await initClobWithApiKey(apiKey, apiSecret, apiPassphrase, traderPrivateKey, traderFunderAddress);
         if (ok) {
-            await sendTelegram(`✅ *API Key configurée!*\n🔑 Key: \`${apiKey.slice(0, 8)}...\`\n\n⚠️ Message supprimé.\n💡 Sur Railway:\n\`POLY\\_API\\_KEY\`\n\`POLY\\_API\\_SECRET\`\n\`POLY\\_API\\_PASSPHRASE\`\n\nPuis /copytrading pour activer.`);
+            const signer = new Wallet(traderPrivateKey);
+            const eoaAddr = signer.address.toLowerCase();
+            const isProxy = traderFunderAddress && traderFunderAddress !== eoaAddr;
+            const proxyLine = isProxy
+                ? `\n🏠 Proxy: \`${traderFunderAddress.slice(0, 6)}...${traderFunderAddress.slice(-4)}\` ✅`
+                : '\n⚠️ Proxy non détecté - /setfunder requis';
+
+            await sendTelegram(`✅ *API Key configurée!*\n🔑 Key: \`${apiKey.slice(0, 8)}...\`${proxyLine}\n\n⚠️ Message supprimé.\n💡 Sur Railway:\n\`POLY\\_API\\_KEY\`\n\`POLY\\_API\\_SECRET\`\n\`POLY\\_API\\_PASSPHRASE\`\n\nPuis /copytrading pour activer.`);
         } else {
             await sendTelegram('❌ Erreur. Vérifiez vos credentials.');
         }
@@ -333,21 +427,86 @@ function setupTelegramCommands() {
         const ok = await initClobWithPrivateKey(formattedKey, traderFunderAddress);
         if (ok) {
             const signer = new Wallet(formattedKey);
-            await sendTelegram(`✅ *Clé configurée!*\n🔑 \`${signer.address}\`\n\n⚠️ Message supprimé.\n💡 Si tu as une API Key Polymarket:\n/setapi \\<key\\> \\<secret\\> \\<passphrase\\>\n\nSinon /copytrading pour activer.`);
+            const eoaAddr = signer.address.toLowerCase();
+            const isProxy = traderFunderAddress && traderFunderAddress !== eoaAddr;
+
+            let proxyInfo = '';
+            if (isProxy) {
+                proxyInfo = `\n🏠 Proxy wallet: \`${traderFunderAddress}\`\n✅ _Proxy auto-détecté!_`;
+            } else {
+                proxyInfo = `\n⚠️ _Proxy wallet non détecté._\n_Utilise /setfunder 0xTonProxyPolymarket_\n_ou /lookup ${eoaAddr}_`;
+            }
+
+            await sendTelegram(`✅ *Clé configurée!*\n🔑 EOA: \`${eoaAddr}\`${proxyInfo}\n\n⚠️ Message supprimé.\n💡 Si tu as une API Key Polymarket:\n/setapi \\<key\\> \\<secret\\> \\<passphrase\\>\n\nPuis /copytrading pour activer.`);
         } else {
             await sendTelegram('❌ Erreur init. Vérifiez la clé.');
         }
     });
 
-    // --- SET FUNDER ---
+    // --- SET FUNDER (proxy wallet) ---
     telegramBot.onText(/\/setfunder(?:@\S+)?\s+(\S+)/, async (msg, match) => {
         if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
         const addr = match[1].trim();
         if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) return await sendTelegram('❌ Adresse invalide.');
 
         traderFunderAddress = addr.toLowerCase();
-        if (traderPrivateKey) await initClobWithPrivateKey(traderPrivateKey, traderFunderAddress);
-        await sendTelegram(`✅ Funder: \`${traderFunderAddress}\`\n💡 Persister: \`POLYMARKET\\_FUNDER\\_ADDRESS\` sur Railway`);
+        if (traderPrivateKey) {
+            const signer = new Wallet(traderPrivateKey);
+            // Re-init avec API key si dispo, sinon private key
+            if (process.env.POLY_API_KEY) {
+                await initClobWithApiKey(process.env.POLY_API_KEY, process.env.POLY_API_SECRET, process.env.POLY_API_PASSPHRASE, traderPrivateKey, traderFunderAddress);
+            } else {
+                await initClobWithPrivateKey(traderPrivateKey, traderFunderAddress);
+            }
+        }
+        await sendTelegram(`✅ *Proxy wallet configuré!*\n\n🏠 Funder (proxy): \`${traderFunderAddress}\`\n\n💡 C'est l'adresse qui détient tes USDC sur Polymarket.\nPersister: \`POLYMARKET\\_FUNDER\\_ADDRESS\` sur Railway`);
+    });
+
+    // --- MY ADDRESS (shows EOA vs proxy) ---
+    telegramBot.onText(/\/myaddress/, async (msg) => {
+        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+
+        if (!traderPrivateKey) {
+            return await sendTelegram('❌ Pas de clé configurée.\n/setkey d\'abord.');
+        }
+
+        const signer = new Wallet(traderPrivateKey);
+        const eoaAddr = signer.address.toLowerCase();
+        const isProxy = traderFunderAddress && traderFunderAddress !== eoaAddr;
+
+        let msg_text = `🔑 *Tes adresses Polymarket:*\n\n`;
+        msg_text += `👤 *EOA (signer):*\n\`${eoaAddr}\`\n_→ Signe les ordres_\n\n`;
+
+        if (isProxy) {
+            msg_text += `🏠 *Proxy wallet (funder):*\n\`${traderFunderAddress}\`\n_→ Détient tes USDC + exécute les trades_\n\n`;
+            msg_text += `✅ Proxy correctement configuré!`;
+        } else {
+            msg_text += `⚠️ *Funder = EOA* (pas de proxy détecté)\n\`${eoaAddr}\`\n\n`;
+            msg_text += `🔍 _Sur Polymarket, ton vrai wallet de trading est un proxy (smart contract)._\n`;
+            msg_text += `_Trouve ton proxy sur ton profil Polymarket ou utilise /lookup_\n`;
+            msg_text += `_Puis: /setfunder 0xTonProxyWallet_`;
+        }
+
+        await sendTelegram(msg_text);
+    });
+
+    // --- LOOKUP (find proxy address for any wallet) ---
+    telegramBot.onText(/\/lookup(?:@\S+)?\s+(\S+)/, async (msg, match) => {
+        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        const addr = match[1].trim();
+        if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) return await sendTelegram('❌ Adresse invalide.');
+
+        await sendTelegram('🔍 Recherche du proxy wallet...');
+
+        const proxy = await resolveProxyAddress(addr.toLowerCase());
+
+        if (proxy && proxy !== addr.toLowerCase()) {
+            await sendTelegram(`✅ *Proxy wallet trouvé!*\n\n📥 Adresse cherchée:\n\`${addr.toLowerCase()}\`\n\n🏠 Proxy wallet:\n\`${proxy}\`\n\n💡 Pour surveiller ce trader: \`/add ${proxy} NomDuTrader\`\n💡 Si c'est toi: \`/setfunder ${proxy}\``);
+        } else if (proxy) {
+            await sendTelegram(`ℹ️ *Résultat:*\n\n\`${addr.toLowerCase()}\`\n\nCette adresse est peut-être déjà un proxy wallet.\nEssaie de l'ajouter directement: \`/add ${addr.toLowerCase()} NomDuTrader\``);
+        } else {
+            await sendTelegram(`❌ *Proxy non trouvé pour:*\n\`${addr.toLowerCase()}\`\n\n_Possible raisons:_\n• L'adresse n'a jamais tradé sur Polymarket\n• C'est déjà une adresse proxy\n• Le profil n'existe pas\n\n💡 Essaie directement: \`/add ${addr.toLowerCase()} NomDuTrader\``);
+        }
     });
 
     // --- TOGGLE COPY ---
@@ -355,9 +514,17 @@ function setupTelegramCommands() {
         if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
         if (!clobClient) return await sendTelegram('❌ D\'abord /setkey');
 
+        // Warn if proxy wallet is not properly set
+        const signer = new Wallet(traderPrivateKey);
+        const isProxy = traderFunderAddress && traderFunderAddress !== signer.address.toLowerCase();
+
         copyTradingEnabled = !copyTradingEnabled;
         const status = copyTradingEnabled ? '🟢 ACTIVÉ' : '🔴 DÉSACTIVÉ';
-        await sendTelegram(`🔄 *Copy-trading: ${status}*\n• x${copyMultiplier} | Max $${maxCopyUSD} | ${wallets.length} wallets`);
+        let proxyWarn = '';
+        if (copyTradingEnabled && !isProxy) {
+            proxyWarn = '\n\n⚠️ *ATTENTION:* Proxy wallet non configuré!\nLe funder = ton EOA, pas ton proxy Polymarket.\nLes trades risquent d\'échouer.\n👉 /setfunder \\<ton proxy Polymarket\\>\n👉 /lookup pour chercher ton proxy';
+        }
+        await sendTelegram(`🔄 *Copy-trading: ${status}*\n• x${copyMultiplier} | Max $${maxCopyUSD} | ${wallets.length} wallets${proxyWarn}`);
     });
 
     // --- MULTIPLIER ---
@@ -485,6 +652,15 @@ function setupTelegramCommands() {
         if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
         const h = Math.floor(process.uptime() / 3600);
         const m = Math.floor((process.uptime() % 3600) / 60);
+
+        let addrInfo = '• Clé: 🔴 Non configurée';
+        if (traderPrivateKey) {
+            const signer = new Wallet(traderPrivateKey);
+            const eoaAddr = signer.address.toLowerCase();
+            const isProxy = traderFunderAddress && traderFunderAddress !== eoaAddr;
+            addrInfo = `• EOA: \`${eoaAddr.slice(0, 6)}...${eoaAddr.slice(-4)}\`\n• Proxy: ${isProxy ? `\`${traderFunderAddress.slice(0, 6)}...${traderFunderAddress.slice(-4)}\` ✅` : '⚠️ Non détecté (/setfunder)'}`;
+        }
+
         await sendTelegram(`📊 *Status*
 • Surveillance: ${isRunning ? '🟢' : '🔴'}
 • Wallets: ${wallets.length}
@@ -496,6 +672,7 @@ function setupTelegramCommands() {
 🔄 *Copy-Trading:*
 • État: ${copyTradingEnabled ? '🟢' : '🔴'}
 • CLOB: ${clobClient ? '🟢' : '🔴'}
+${addrInfo}
 • x${copyMultiplier} | Max $${maxCopyUSD}
 • Copiés: ${copiedTrades.filter(c => c.success).length}/${copiedTrades.length}
 
