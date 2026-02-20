@@ -218,6 +218,15 @@ async function initClobWithPrivateKey(privateKey, funderAddr) {
 async function executeCopyTrade(originalTrade, wallet) {
     if (!copyTradingEnabled || !clobClient) return;
 
+    // Vérifier que le proxy wallet est configuré (pas juste l'EOA)
+    if (traderPrivateKey && traderFunderAddress) {
+        const signer = new Wallet(traderPrivateKey);
+        if (traderFunderAddress === signer.address.toLowerCase()) {
+            await sendTelegram(`⚠️ *Copy-trade bloqué!*\n\nLe funder = ton EOA (pas ton proxy Polymarket).\nLes trades échoueraient.\n\n👉 /setfunder \\<ton proxy wallet Polymarket\\>\n👉 /lookup ${signer.address.toLowerCase()}\n👉 /myaddress pour voir tes adresses`);
+            return;
+        }
+    }
+
     try {
         const sideStr = (originalTrade.side || originalTrade.type || originalTrade.action || '').toLowerCase();
         const isBuy = sideStr.includes('buy') || sideStr.includes('bid');
