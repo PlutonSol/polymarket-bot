@@ -2,6 +2,7 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const { ClobClient } = require('@polymarket/clob-client');
 const { Wallet } = require('@ethersproject/wallet');
+const { ethers } = require('ethers');
 
 // ============================================
 // CONFIGURATION (tout via env vars pour Railway)
@@ -32,6 +33,38 @@ let signatureType = parseInt(process.env.SIGNATURE_TYPE, 10) || 0;
 let copyMultiplier = parseFloat(process.env.COPY_MULTIPLIER) || 1.0;
 let maxCopyUSD = parseFloat(process.env.MAX_COPY_USD) || 500;
 let copiedTrades = [];
+let proportionalMode = (process.env.PROPORTIONAL_MODE || 'true').toLowerCase() === 'true'; // ON par défaut
+
+// ============================================
+// USDC BALANCE (Polygon on-chain)
+// ============================================
+const POLYGON_RPC = process.env.POLYGON_RPC || 'https://polygon-rpc.com';
+const USDC_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC.e sur Polygon
+const USDC_ABI = ['function balanceOf(address) view returns (uint256)'];
+
+// Cache des balances (évite de spam le RPC)
+const balanceCache = new Map(); // address -> { balance, timestamp }
+const BALANCE_CACHE_TTL = 120000; // 2 minutes
+
+async function getUSDCBalance(address) {
+    const addr = address.toLowerCase();
+    const cached = balanceCache.get(addr);
+    if (cached && Date.now() - cached.timestamp < BALANCE_CACHE_TTL) {
+        return cached.balance;
+    }
+
+    try {
+        const provider = new ethers.providers.JsonRpcProvider(POLYGON_RPC);
+        const usdc = new ethers.Contract(USDC_ADDRESS, USDC_ABI, provider);
+        const raw = await usdc.balanceOf(addr);
+        const balance = parseFloat(ethers.utils.formatUnits(raw, 6));
+        balanceCache.set(addr, { balance, timestamp: Date.now() });
+        return balance;
+    } catch (e) {
+        console.error(`Balance error (${addr.slice(0, 8)}):`, e.message);
+        return null;
+    }
+}
 
 // ============================================
 // WALLET MANAGEMENT (en memoire, charge depuis env)
@@ -240,12 +273,40 @@ async function executeCopyTrade(originalTrade, wallet) {
             return;
         }
 
-        let copyUsd = origUsdcSize * copyMultiplier;
-        if (copyUsd > maxCopyUSD) copyUsd = maxCopyUSD;
+        // --- CALCUL DE LA TAILLE (proportionnel ou multiplicateur) ---
+        let copyUsd;
+        let sizingInfo = '';
+
+        if (proportionalMode) {
+            const [trackedBalance, myBalance] = await Promise.all([
+                getUSDCBalance(wallet.address),
+                getUSDCBalance(traderFunderAddress)
+            ]);
+
+            if (trackedBalance && trackedBalance > 0 && myBalance && myBalance > 0) {
+                const proportion = origUsdcSize / trackedBalance;
+                copyUsd = proportion * myBalance;
+                sizingInfo = `📐 Proportionnel: ${(proportion * 100).toFixed(1)}% de $${myBalance.toFixed(0)}`;
+                console.log(`Proportional: trader=$${trackedBalance.toFixed(0)} trade=$${origUsdcSize.toFixed(2)} (${(proportion * 100).toFixed(1)}%) → moi=$${myBalance.toFixed(0)} → copy=$${copyUsd.toFixed(2)}`);
+            } else {
+                // Fallback au multiplicateur si balances indisponibles
+                copyUsd = origUsdcSize * copyMultiplier;
+                sizingInfo = `⚠️ Balances indispo → fallback x${copyMultiplier}`;
+                console.log(`Proportional fallback: balance unavailable (tracked=${trackedBalance}, mine=${myBalance}), using multiplier x${copyMultiplier}`);
+            }
+        } else {
+            copyUsd = origUsdcSize * copyMultiplier;
+            sizingInfo = `📐 Multiplicateur: x${copyMultiplier}`;
+        }
+
+        if (copyUsd > maxCopyUSD) {
+            sizingInfo += ` (cap $${maxCopyUSD})`;
+            copyUsd = maxCopyUSD;
+        }
         const copySize = Math.floor(copyUsd / origPrice);
 
         if (copySize <= 0) {
-            await sendTelegram(`⚠️ *Copy-trade ignoré*\nTaille trop petite après calcul`);
+            await sendTelegram(`⚠️ *Copy-trade ignoré*\nTaille trop petite après calcul\n${sizingInfo}`);
             return;
         }
 
@@ -278,7 +339,7 @@ async function executeCopyTrade(originalTrade, wallet) {
         }
 
         const side = isBuy ? 'BUY' : 'SELL';
-        await sendTelegram(`🔄 *Copy-trade en cours...*\n👤 ${wallet.label}\n📊 ${side} ${copySize} shares @ ${origPrice.toFixed(2)}\n💰 ~$${(copySize * origPrice).toFixed(2)}`);
+        await sendTelegram(`🔄 *Copy-trade en cours...*\n👤 ${wallet.label} → $${origUsdcSize.toFixed(2)}\n📊 ${side} ${copySize} shares @ ${origPrice.toFixed(2)}\n💰 ~$${(copySize * origPrice).toFixed(2)}\n${sizingInfo}`);
 
         const orderResp = await clobClient.createAndPostOrder(
             { tokenID: tokenId, price: origPrice, size: copySize, side: side },
@@ -294,7 +355,7 @@ async function executeCopyTrade(originalTrade, wallet) {
             orderId: orderResp.orderID || orderResp.id || 'N/A', success: true,
         });
 
-        await sendTelegram(`✅ *Copy-trade exécuté!*\n\n👤 Copié de: *${wallet.label}*\n📊 *${side}* ${copySize} shares @ ${(origPrice * 100).toFixed(0)}¢\n💰 Total: *$${(copySize * origPrice).toFixed(2)}*\n🏷️ ${market.slice(0, 60)}\n🆔 \`${orderResp.orderID || orderResp.id || 'OK'}\``);
+        await sendTelegram(`✅ *Copy-trade exécuté!*\n\n👤 Copié de: *${wallet.label}*\n📊 *${side}* ${copySize} shares @ ${(origPrice * 100).toFixed(0)}¢\n💰 Total: *$${(copySize * origPrice).toFixed(2)}*\n${sizingInfo}\n🏷️ ${market.slice(0, 60)}\n🆔 \`${orderResp.orderID || orderResp.id || 'OK'}\``);
 
     } catch (e) {
         console.error('❌ Copy-trade error:', e.message);
@@ -356,7 +417,9 @@ _Railway Edition_
 /setfunder \\<adresse\\> - Proxy wallet Polymarket
 /myaddress - Voir EOA + proxy
 /copytrading - On/Off
-/setmultiplier \\<x\\> - Multiplicateur
+/proportional - Proportionnel/Multiplicateur
+/balance - Voir balances USDC
+/setmultiplier \\<x\\> - Multiplicateur (si mode fixe)
 /setmax \\<$\\> - Max par trade
 /copyhistory - Historique
 
@@ -533,7 +596,8 @@ function setupTelegramCommands() {
         if (copyTradingEnabled && !isProxy) {
             proxyWarn = '\n\n⚠️ *ATTENTION:* Proxy wallet non configuré!\nLe funder = ton EOA, pas ton proxy Polymarket.\nLes trades risquent d\'échouer.\n👉 /setfunder \\<ton proxy Polymarket\\>\n👉 /lookup pour chercher ton proxy';
         }
-        await sendTelegram(`🔄 *Copy-trading: ${status}*\n• x${copyMultiplier} | Max $${maxCopyUSD} | ${wallets.length} wallets${proxyWarn}`);
+        const modeStr = proportionalMode ? '📐 Proportionnel' : `x${copyMultiplier}`;
+        await sendTelegram(`🔄 *Copy-trading: ${status}*\n• ${modeStr} | Max $${maxCopyUSD} | ${wallets.length} wallets${proxyWarn}`);
     });
 
     // --- MULTIPLIER ---
@@ -552,6 +616,53 @@ function setupTelegramCommands() {
         if (isNaN(val) || val <= 0) return await sendTelegram('❌ Invalide');
         maxCopyUSD = val;
         await sendTelegram(`✅ Max: *$${val}*\n💡 Persister: \`MAX\\_COPY\\_USD=${val}\``);
+    });
+
+    // --- PROPORTIONAL MODE TOGGLE ---
+    telegramBot.onText(/\/proportional/, async (msg) => {
+        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        proportionalMode = !proportionalMode;
+        const mode = proportionalMode ? '🟢 PROPORTIONNEL' : '🔴 MULTIPLICATEUR';
+        const desc = proportionalMode
+            ? `Le bot copie le même % du capital que le trader.\nEx: trader met 5% de son USDC → tu mets 5% du tien.`
+            : `Le bot copie avec un multiplicateur fixe x${copyMultiplier}.\nEx: trader trade $100 → tu copies $${(100 * copyMultiplier).toFixed(0)}.`;
+        await sendTelegram(`📐 *Mode: ${mode}*\n\n${desc}\n\n💡 Persister: \`PROPORTIONAL\\_MODE=${proportionalMode}\``);
+    });
+
+    // --- BALANCE CHECK ---
+    telegramBot.onText(/\/balance/, async (msg) => {
+        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+
+        await sendTelegram('🔍 Lecture des balances USDC on-chain...');
+
+        const myAddr = traderFunderAddress;
+        const myBalance = myAddr ? await getUSDCBalance(myAddr) : null;
+
+        let txt = '💰 *Balances USDC (Polygon):*\n\n';
+
+        if (myAddr && myBalance !== null) {
+            txt += `🏠 *Mon proxy:*\n\`${myAddr}\`\n💵 *$${myBalance.toFixed(2)}* USDC\n\n`;
+        } else if (myAddr) {
+            txt += `🏠 *Mon proxy:* \`${myAddr}\`\n⚠️ Balance indisponible\n\n`;
+        } else {
+            txt += `🏠 Proxy non configuré\n\n`;
+        }
+
+        txt += '👁️ *Wallets surveillés:*\n';
+        for (const w of wallets) {
+            const bal = await getUSDCBalance(w.address);
+            if (bal !== null) {
+                txt += `• ${w.label}: *$${bal.toFixed(2)}*\n`;
+                if (myBalance && bal > 0) {
+                    txt += `  _Ratio: 1:${(bal / myBalance).toFixed(1)}_\n`;
+                }
+            } else {
+                txt += `• ${w.label}: ⚠️ indisponible\n`;
+            }
+        }
+
+        txt += `\n📐 Mode: ${proportionalMode ? 'Proportionnel' : `Multiplicateur x${copyMultiplier}`}`;
+        await sendTelegram(txt);
     });
 
     // --- COPY HISTORY ---
@@ -682,7 +793,7 @@ function setupTelegramCommands() {
 • État: ${copyTradingEnabled ? '🟢' : '🔴'}
 • CLOB: ${clobClient ? '🟢' : '🔴'}
 ${addrInfo}
-• x${copyMultiplier} | Max $${maxCopyUSD}
+• Mode: ${proportionalMode ? '📐 Proportionnel' : `x${copyMultiplier}`} | Max $${maxCopyUSD}
 • Copiés: ${copiedTrades.filter(c => c.success).length}/${copiedTrades.length}
 
 🚂 _Railway_`);
