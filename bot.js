@@ -27,6 +27,17 @@ if (!CONFIG.TELEGRAM_BOT_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) {
     process.exit(1);
 }
 
+// Avertissements pour les variables de copy-trading
+if (!process.env.POLYMARKET_PRIVATE_KEY) {
+    console.warn('⚠️ POLYMARKET_PRIVATE_KEY non définie - copy-trading désactivé');
+}
+if (!process.env.TELEGRAM_USER_ID) {
+    console.warn('⚠️ TELEGRAM_USER_ID non défini - toute personne avec le chat_id pourra contrôler le bot');
+}
+if (process.env.POLYMARKET_PRIVATE_KEY && !process.env.POLYMARKET_FUNDER_ADDRESS) {
+    console.warn('⚠️ POLYMARKET_FUNDER_ADDRESS non défini - le proxy wallet sera auto-résolu (moins fiable)');
+}
+
 let telegramBot;
 let isRunning = false;
 let knownTrades = new Map();
@@ -64,7 +75,7 @@ function saveState() {
         for (const [addr, ts] of Object.entries(walletLastTimestamp)) {
             state.lastSeenTimestamps[addr] = ts;
         }
-        fs.writeFileSync(STATE_FILE, JSON.stringify(state), 'utf8');
+        fs.writeFileSync(STATE_FILE, JSON.stringify(state), { encoding: 'utf8', mode: 0o600 });
     } catch (e) {
         console.error('State save error:', e.message);
     }
@@ -112,6 +123,18 @@ let proportionalMode = (process.env.PROPORTIONAL_MODE || 'true').toLowerCase() =
 const copyCooldowns = new Map(); // tokenId -> timestamp dernier copy
 const COPY_COOLDOWN_MS = 30000; // 30s
 
+// Rate limiting commandes Telegram (anti-spam)
+const commandRateLimit = new Map(); // command -> timestamp dernier appel
+const COMMAND_COOLDOWN_MS = 3000; // 3s entre chaque commande
+
+function isRateLimited(command) {
+    const now = Date.now();
+    const last = commandRateLimit.get(command) || 0;
+    if (now - last < COMMAND_COOLDOWN_MS) return true;
+    commandRateLimit.set(command, now);
+    return false;
+}
+
 // ============================================
 // USDC BALANCE (Polygon on-chain)
 // ============================================
@@ -137,6 +160,7 @@ const BALANCE_CACHE_TTL = 60000; // 1 minute
 // Cache market info + tick sizes (évite des appels redondants)
 const marketInfoCache = new Map(); // conditionId -> data
 const tickSizeCache = new Map(); // tokenId -> tickSize
+const MAX_CACHE_SIZE = 500; // Limite mémoire des caches
 
 // Circuit breaker: si trop d'erreurs consécutives, on pause les appels
 const circuitBreaker = {
@@ -162,6 +186,18 @@ const circuitBreaker = {
     },
     recordSuccess() { this.failures = 0; },
 };
+
+// Echapper les caractères spéciaux Markdown pour Telegram
+function escapeMd(text) {
+    if (!text) return '';
+    return text.replace(/([*_`\[\]()~>#+\-=|{}.!\\])/g, '\\$1');
+}
+
+// Masquer une adresse dans les logs (affiche seulement début...fin)
+function maskAddr(addr) {
+    if (!addr || addr.length < 12) return addr || '???';
+    return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
+}
 
 // Fetch avec timeout intégré
 async function fetchWithTimeout(url, options = {}) {
@@ -218,12 +254,6 @@ function loadWalletsFromEnv() {
             const label = labelParts.join(':') || address.slice(0, 8) + '...';
             return { address: address.toLowerCase().trim(), label: label.trim() };
         }).filter(w => /^0x[a-fA-F0-9]{40}$/.test(w.address));
-    }
-
-    // Wallet par defaut toujours present
-    const defaultAddr = '0x594edb9112f526fa6a80b8f858a6379c8a2c1c11';
-    if (!wallets.find(w => w.address === defaultAddr)) {
-        wallets.push({ address: defaultAddr, label: 'Trader1' });
     }
 
     console.log(`📂 ${wallets.length} wallet(s) chargé(s)`);
@@ -310,7 +340,7 @@ async function initClobWithApiKey(apiKey, apiSecret, apiPassphrase, privateKey, 
             const proxy = await resolveProxyAddress(signer.address);
             if (proxy) {
                 traderFunderAddress = proxy;
-                console.log(`✅ Proxy wallet résolu: ${proxy}`);
+                console.log(`✅ Proxy wallet résolu: ${maskAddr(proxy)}`);
             } else {
                 traderFunderAddress = signer.address;
                 console.log('⚠️ Proxy wallet non trouvé - utilisation EOA par défaut');
@@ -353,7 +383,7 @@ async function initClobWithPrivateKey(privateKey, funderAddr) {
             const proxy = await resolveProxyAddress(signer.address);
             if (proxy) {
                 traderFunderAddress = proxy;
-                console.log(`✅ Proxy wallet résolu: ${proxy}`);
+                console.log(`✅ Proxy wallet résolu: ${maskAddr(proxy)}`);
             } else {
                 traderFunderAddress = signer.address;
                 console.log('⚠️ Proxy wallet non trouvé - utilisation EOA par défaut');
@@ -588,6 +618,7 @@ async function executeCopyTrade(originalTrade, wallet) {
 
         // --- Check slippage: comparer prix trader vs orderbook ---
         let slippageInfo = '';
+        let executionPrice = origPrice;
         try {
             const book = await clobClient.getOrderBook(tokenId);
             const bestPrice = isBuy
@@ -597,10 +628,11 @@ async function executeCopyTrade(originalTrade, wallet) {
             if (bestPrice && bestPrice > 0) {
                 const slippagePct = Math.abs(bestPrice - origPrice) / origPrice * 100;
                 if (slippagePct > CONFIG.SLIPPAGE_MAX_PCT) {
-                    slippageInfo = `⚠️ Slippage ${slippagePct.toFixed(1)}% (live ${(bestPrice * 100).toFixed(0)}¢ vs ${(origPrice * 100).toFixed(0)}¢)`;
+                    slippageInfo = `⚠️ Slippage ${slippagePct.toFixed(1)}% (live ${(bestPrice * 100).toFixed(0)}¢ vs trader ${(origPrice * 100).toFixed(0)}¢)`;
                     console.log(`⚠️ Slippage ${slippagePct.toFixed(1)}% détecté (${wallet.label})`);
-                    await sendTelegram(`⚠️ *Slippage élevé détecté!*\n\n👤 ${wallet.label}\n📊 ${side} - Prix trader: ${(origPrice * 100).toFixed(0)}¢ | Live: ${(bestPrice * 100).toFixed(0)}¢\nSlippage: *${slippagePct.toFixed(1)}%* (max ${CONFIG.SLIPPAGE_MAX_PCT}%)\n\n_Trade exécuté au prix live_`);
-                    // Exécuter au prix live plutôt qu'au prix stale
+                    // Utiliser le prix live pour ne pas overpay/undersell
+                    executionPrice = bestPrice;
+                    await sendTelegram(`⚠️ *Slippage élevé détecté!*\n\n👤 ${wallet.label}\n📊 ${side} - Prix trader: ${(origPrice * 100).toFixed(0)}¢ | Live: ${(bestPrice * 100).toFixed(0)}¢\nSlippage: *${slippagePct.toFixed(1)}%* (max ${CONFIG.SLIPPAGE_MAX_PCT}%)\n\n_Trade exécuté au prix live ${(bestPrice * 100).toFixed(0)}¢_`);
                 }
             }
         } catch (e) {
@@ -611,7 +643,7 @@ async function executeCopyTrade(originalTrade, wallet) {
         // PHASE 2: EXÉCUTION AVEC RETRY
         // ============================================
         const orderResp = await postOrderWithRetry(
-            { tokenID: tokenId, price: origPrice, size: copySize, side: side },
+            { tokenID: tokenId, price: executionPrice, size: copySize, side: side },
             { tickSize: tickSize, negRisk: negRisk }
         );
 
@@ -623,13 +655,13 @@ async function executeCopyTrade(originalTrade, wallet) {
 
         copiedTrades.push({
             time: new Date().toISOString(), from: wallet.label, side,
-            price: origPrice, size: copySize, usd: copySize * origPrice,
+            price: executionPrice, size: copySize, usd: copySize * executionPrice,
             market: market.slice(0, 50),
             orderId: orderResp.orderID || orderResp.id || 'N/A', success: true,
             latencyMs: totalLatency,
         });
 
-        await sendTelegram(`✅ *Copy-trade exécuté!*\n\n👤 *${wallet.label}* → $${origUsdcSize.toFixed(2)}\n📊 *${side}* ${copySize} shares @ ${(origPrice * 100).toFixed(0)}¢\n💰 *$${(copySize * origPrice).toFixed(2)}*\n${sizingInfo}\n🏷️ ${market.slice(0, 60)}\n⚡ ${totalLatency}ms${slippageInfo ? `\n${slippageInfo}` : ''}\n🆔 \`${orderResp.orderID || orderResp.id || 'OK'}\``);
+        await sendTelegram(`✅ *Copy-trade exécuté!*\n\n👤 *${wallet.label}* → $${origUsdcSize.toFixed(2)}\n📊 *${side}* ${copySize} shares @ ${(executionPrice * 100).toFixed(0)}¢\n💰 *$${(copySize * executionPrice).toFixed(2)}*\n${sizingInfo}\n🏷️ ${escapeMd(market.slice(0, 60))}\n⚡ ${totalLatency}ms${slippageInfo ? `\n${slippageInfo}` : ''}\n🆔 \`${orderResp.orderID || orderResp.id || 'OK'}\``);
 
         // Vérification du fill en background (ne bloque pas)
         const oid = orderResp.orderID || orderResp.id;
@@ -697,8 +729,7 @@ _Railway Edition_
 /lookup \\<adresse\\> - Trouver proxy wallet
 
 📋 *Copy-Trading:*
-/setkey \\<clé\\> - Clé privée
-/setapi \\<key\\> \\<secret\\> \\<pass\\> - API Key
+🔒 Clé privée + API Key via env Railway uniquement
 /setfunder \\<adresse\\> - Proxy wallet Polymarket
 /myaddress - Voir EOA + proxy
 /copytrading - On/Off
@@ -738,71 +769,27 @@ _Pour persister: var env WALLETS sur Railway_`);
 // ============================================
 function setupTelegramCommands() {
 
-    // --- SET API KEY (key + secret + passphrase) ---
-    telegramBot.onText(/\/setapi(?:@\S+)?\s+(\S+)\s+(\S+)\s+(\S+)/, async (msg, match) => {
+    // --- /setkey et /setapi DÉSACTIVÉS pour raison de sécurité ---
+    // Les clés privées et API credentials ne doivent JAMAIS transiter via Telegram.
+    // Telegram conserve les messages sur ses serveurs même après suppression.
+    // Configurer uniquement via variables d'environnement Railway:
+    //   POLYMARKET_PRIVATE_KEY, POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE
+    telegramBot.onText(/\/setkey/, async (msg) => {
         if (!isAuthorized(msg)) return;
         try { await telegramBot.deleteMessage(msg.chat.id, msg.message_id); } catch (e) {}
-
-        const apiKey = match[1].trim();
-        const apiSecret = match[2].trim();
-        const apiPassphrase = match[3].trim();
-
-        if (!traderPrivateKey) {
-            return await sendTelegram('❌ D\'abord /setkey avec ta clé privée.\nL\'API key seule ne suffit pas (signature requise).\n\n1. /setkey \\<clé privée\\>\n2. /setapi \\<key\\> \\<secret\\> \\<passphrase\\>');
-        }
-
-        await sendTelegram('🔄 Initialisation avec API Key...');
-
-        const ok = await initClobWithApiKey(apiKey, apiSecret, apiPassphrase, traderPrivateKey, traderFunderAddress);
-        if (ok) {
-            const signer = new Wallet(traderPrivateKey);
-            const eoaAddr = signer.address.toLowerCase();
-            const isProxy = traderFunderAddress && traderFunderAddress !== eoaAddr;
-            const proxyLine = isProxy
-                ? `\n🏠 Proxy: \`${traderFunderAddress.slice(0, 6)}...${traderFunderAddress.slice(-4)}\` ✅`
-                : '\n⚠️ Proxy non détecté - /setfunder requis';
-
-            await sendTelegram(`✅ *API Key configurée!*\n🔑 Key: \`${apiKey.slice(0, 8)}...\`${proxyLine}\n\n⚠️ Message supprimé.\n💡 Sur Railway:\n\`POLY\\_API\\_KEY\`\n\`POLY\\_API\\_SECRET\`\n\`POLY\\_API\\_PASSPHRASE\`\n\nPuis /copytrading pour activer.`);
-        } else {
-            await sendTelegram('❌ Erreur. Vérifiez vos credentials.');
-        }
+        await sendTelegram(`🔒 *Commande désactivée pour raison de sécurité*\n\n⚠️ Envoyer une clé privée via Telegram est dangereux:\n• Les messages restent sur les serveurs Telegram\n• La suppression n'est pas fiable\n• Ton historique/backup contient la clé\n\n✅ *Configurer via Railway (variables d'env):*\n\`POLYMARKET\\_PRIVATE\\_KEY=0x...\`\n\nPuis redémarrer le bot.`);
     });
 
-    // --- SET PRIVATE KEY ---
-    telegramBot.onText(/\/setkey(?:@\S+)?\s+(\S+)/, async (msg, match) => {
+    telegramBot.onText(/\/setapi/, async (msg) => {
         if (!isAuthorized(msg)) return;
         try { await telegramBot.deleteMessage(msg.chat.id, msg.message_id); } catch (e) {}
-
-        const key = match[1].trim();
-        if (!/^(0x)?[a-fA-F0-9]{64}$/.test(key)) {
-            return await sendTelegram('❌ Clé invalide. 64 hex (avec ou sans 0x).');
-        }
-
-        const formattedKey = key.startsWith('0x') ? key : '0x' + key;
-        await sendTelegram('🔄 Initialisation CLOB...');
-
-        const ok = await initClobWithPrivateKey(formattedKey, traderFunderAddress);
-        if (ok) {
-            const signer = new Wallet(formattedKey);
-            const eoaAddr = signer.address.toLowerCase();
-            const isProxy = traderFunderAddress && traderFunderAddress !== eoaAddr;
-
-            let proxyInfo = '';
-            if (isProxy) {
-                proxyInfo = `\n🏠 Proxy wallet: \`${traderFunderAddress}\`\n✅ _Proxy auto-détecté!_`;
-            } else {
-                proxyInfo = `\n⚠️ _Proxy wallet non détecté._\n_Utilise /setfunder 0xTonProxyPolymarket_\n_ou /lookup ${eoaAddr}_`;
-            }
-
-            await sendTelegram(`✅ *Clé configurée!*\n🔑 EOA: \`${eoaAddr}\`${proxyInfo}\n\n⚠️ Message supprimé.\n💡 Si tu as une API Key Polymarket:\n/setapi \\<key\\> \\<secret\\> \\<passphrase\\>\n\nPuis /copytrading pour activer.`);
-        } else {
-            await sendTelegram('❌ Erreur init. Vérifiez la clé.');
-        }
+        await sendTelegram(`🔒 *Commande désactivée pour raison de sécurité*\n\n⚠️ Envoyer des API credentials via Telegram est dangereux.\n\n✅ *Configurer via Railway (variables d'env):*\n\`POLY\\_API\\_KEY=...\`\n\`POLY\\_API\\_SECRET=...\`\n\`POLY\\_API\\_PASSPHRASE=...\`\n\nPuis redémarrer le bot.`);
     });
 
     // --- SET FUNDER (proxy wallet) ---
     telegramBot.onText(/\/setfunder(?:@\S+)?\s+(\S+)/, async (msg, match) => {
         if (!isAuthorized(msg)) return;
+        if (isRateLimited('setfunder')) return;
         const addr = match[1].trim();
         if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) return await sendTelegram('❌ Adresse invalide.');
 
@@ -869,7 +856,8 @@ function setupTelegramCommands() {
     // --- TOGGLE COPY ---
     telegramBot.onText(/\/copytrading/, async (msg) => {
         if (!isAuthorized(msg)) return;
-        if (!clobClient) return await sendTelegram('❌ D\'abord /setkey');
+        if (isRateLimited('copytrading')) return;
+        if (!clobClient) return await sendTelegram('❌ Configurez POLYMARKET\\_PRIVATE\\_KEY dans les variables d\'env Railway d\'abord.');
 
         // Warn if proxy wallet is not properly set
         const signer = new Wallet(traderPrivateKey);
@@ -917,6 +905,7 @@ function setupTelegramCommands() {
     // --- BALANCE CHECK ---
     telegramBot.onText(/\/balance/, async (msg) => {
         if (!isAuthorized(msg)) return;
+        if (isRateLimited('balance')) return;
 
         await sendTelegram('🔍 Lecture des balances USDC on-chain...');
 
@@ -979,6 +968,7 @@ function setupTelegramCommands() {
     // --- ADD WALLET ---
     telegramBot.onText(/\/add(?:@\S+)?\s+(\S+)\s*(.*)?/, async (msg, match) => {
         if (!isAuthorized(msg)) return;
+        if (isRateLimited('add')) return;
         const address = match[1];
         const label = (match[2] || '').trim();
         if (!/^0x[a-fA-F0-9]{40}$/.test(address)) return await sendTelegram('❌ Adresse invalide.');
@@ -994,6 +984,7 @@ function setupTelegramCommands() {
     // --- REMOVE WALLET ---
     telegramBot.onText(/\/remove(?:@\S+)?\s+(.+)/, async (msg, match) => {
         if (!isAuthorized(msg)) return;
+        if (isRateLimited('remove')) return;
         const removed = removeWallet(match[1]);
         if (removed) {
             await sendTelegram(`🗑️ Supprimé: *${removed.label}*\n\`${removed.address}\`\nRestant: ${wallets.length}\n\n💡 Pensez à mettre à jour WALLETS sur Railway.`);
@@ -1133,6 +1124,10 @@ async function fetchMarketInfo(conditionId) {
         if (res.ok) {
             const data = await res.json();
             if (Array.isArray(data) && data.length > 0) {
+                if (marketInfoCache.size >= MAX_CACHE_SIZE) {
+                    const oldest = marketInfoCache.keys().next().value;
+                    marketInfoCache.delete(oldest);
+                }
                 marketInfoCache.set(conditionId, data[0]);
                 return data[0];
             }
@@ -1149,6 +1144,10 @@ async function getCachedTickSize(tokenId) {
 
     try {
         const ts = await clobClient.getTickSize(tokenId);
+        if (tickSizeCache.size >= MAX_CACHE_SIZE) {
+            const oldest = tickSizeCache.keys().next().value;
+            tickSizeCache.delete(oldest);
+        }
         tickSizeCache.set(tokenId, ts);
         return ts;
     } catch (e) {
@@ -1293,6 +1292,7 @@ async function notifyTrade(t, wallet) {
     const emoji = isBuy ? '🟢 ACHAT' : '🔴 VENTE';
     let market = t.title || t.question || t.market || t.description || 'Marché inconnu';
     if (market.length > 80) market = market.slice(0, 80) + '...';
+    market = escapeMd(market);
 
     let outcome = t.outcome || '';
     if (!outcome && t.outcomeIndex !== undefined) outcome = t.outcomeIndex === 0 ? 'Yes ✅' : 'No ❌';
