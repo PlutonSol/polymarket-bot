@@ -8,13 +8,22 @@ const { ethers } = require('ethers');
 // CONFIGURATION (tout via env vars pour Railway)
 // ============================================
 const CONFIG = {
-    TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '8525426243:AAHfQdqz1jUD4algSX15z2SHvsziOG0rxxs',
-    TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '410866851',
-    CHECK_INTERVAL: parseInt(process.env.CHECK_INTERVAL, 10) || 2000, // 2s pour latence minimale
+    TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID,
+    TELEGRAM_USER_ID: process.env.TELEGRAM_USER_ID || '', // Optionnel: vérifie aussi le user_id
+    CHECK_INTERVAL: parseInt(process.env.CHECK_INTERVAL, 10) || 2000,
     MIN_TRADE_USD: parseFloat(process.env.MIN_TRADE_USD) || 10,
+    FETCH_TIMEOUT: parseInt(process.env.FETCH_TIMEOUT, 10) || 8000, // 8s timeout sur les fetch
+    SLIPPAGE_MAX_PCT: parseFloat(process.env.SLIPPAGE_MAX_PCT) || 3, // 3% slippage max
     CLOB_HOST: 'https://clob.polymarket.com',
     CHAIN_ID: 137,
 };
+
+// Vérification des variables requises au démarrage
+if (!CONFIG.TELEGRAM_BOT_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) {
+    console.error('❌ TELEGRAM_BOT_TOKEN et TELEGRAM_CHAT_ID sont requis dans les variables d\'environnement.');
+    process.exit(1);
+}
 
 let telegramBot;
 let isRunning = false;
@@ -35,12 +44,27 @@ let maxCopyUSD = parseFloat(process.env.MAX_COPY_USD) || 500;
 let copiedTrades = [];
 let proportionalMode = (process.env.PROPORTIONAL_MODE || 'true').toLowerCase() === 'true'; // ON par défaut
 
+// Anti-doublon: cooldown par tokenId (empêche 2 copy-trades sur le même marché en 30s)
+const copyCooldowns = new Map(); // tokenId -> timestamp dernier copy
+const COPY_COOLDOWN_MS = 30000; // 30s
+
 // ============================================
 // USDC BALANCE (Polygon on-chain)
 // ============================================
 const POLYGON_RPC = process.env.POLYGON_RPC || 'https://polygon-rpc.com';
 const USDC_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174'; // USDC.e sur Polygon
 const USDC_ABI = ['function balanceOf(address) view returns (uint256)'];
+
+// Provider RPC singleton (réutilisé, pas recréé à chaque appel)
+let rpcProvider = null;
+let usdcContract = null;
+function getProvider() {
+    if (!rpcProvider) {
+        rpcProvider = new ethers.providers.JsonRpcProvider(POLYGON_RPC);
+        usdcContract = new ethers.Contract(USDC_ADDRESS, USDC_ABI, rpcProvider);
+    }
+    return { provider: rpcProvider, usdc: usdcContract };
+}
 
 // Cache des balances (évite de spam le RPC)
 const balanceCache = new Map(); // address -> { balance, timestamp }
@@ -50,6 +74,50 @@ const BALANCE_CACHE_TTL = 60000; // 1 minute
 const marketInfoCache = new Map(); // conditionId -> data
 const tickSizeCache = new Map(); // tokenId -> tickSize
 
+// Circuit breaker: si trop d'erreurs consécutives, on pause les appels
+const circuitBreaker = {
+    failures: 0,
+    lastFailure: 0,
+    threshold: 5,         // 5 erreurs consécutives = circuit ouvert
+    cooldown: 30000,      // 30s de pause avant retry
+    isOpen() {
+        if (this.failures < this.threshold) return false;
+        if (Date.now() - this.lastFailure > this.cooldown) {
+            this.failures = 0; // Reset après cooldown
+            return false;
+        }
+        return true;
+    },
+    recordFailure() {
+        this.failures++;
+        this.lastFailure = Date.now();
+        if (this.failures === this.threshold) {
+            console.error(`🔴 Circuit breaker OUVERT (${this.threshold} erreurs) - pause ${this.cooldown / 1000}s`);
+            sendTelegram(`🔴 *Circuit breaker activé*\n${this.threshold} erreurs API consécutives\nPause ${this.cooldown / 1000}s puis retry auto`).catch(() => {});
+        }
+    },
+    recordSuccess() { this.failures = 0; },
+};
+
+// Fetch avec timeout intégré
+async function fetchWithTimeout(url, options = {}) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), CONFIG.FETCH_TIMEOUT);
+    try {
+        const res = await fetch(url, { ...options, signal: controller.signal });
+        return res;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+// Auth Telegram renforcée: vérifie chat_id ET user_id si configuré
+function isAuthorized(msg) {
+    if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return false;
+    if (CONFIG.TELEGRAM_USER_ID && msg.from && msg.from.id.toString() !== CONFIG.TELEGRAM_USER_ID) return false;
+    return true;
+}
+
 async function getUSDCBalance(address) {
     const addr = address.toLowerCase();
     const cached = balanceCache.get(addr);
@@ -58,14 +126,16 @@ async function getUSDCBalance(address) {
     }
 
     try {
-        const provider = new ethers.providers.JsonRpcProvider(POLYGON_RPC);
-        const usdc = new ethers.Contract(USDC_ADDRESS, USDC_ABI, provider);
+        const { usdc } = getProvider();
         const raw = await usdc.balanceOf(addr);
         const balance = parseFloat(ethers.utils.formatUnits(raw, 6));
         balanceCache.set(addr, { balance, timestamp: Date.now() });
         return balance;
     } catch (e) {
         console.error(`Balance error (${addr.slice(0, 8)}):`, e.message);
+        // Si le provider est cassé, le recréer
+        rpcProvider = null;
+        usdcContract = null;
         return null;
     }
 }
@@ -131,7 +201,7 @@ async function resolveProxyAddress(address) {
 
     // Methode 1: Gamma API profiles endpoint
     try {
-        const res = await fetch(`https://gamma-api.polymarket.com/profiles/${addr}`);
+        const res = await fetchWithTimeout(`https://gamma-api.polymarket.com/profiles/${addr}`);
         if (res.ok) {
             const data = await res.json();
             if (data && data.proxyWallet) {
@@ -144,7 +214,7 @@ async function resolveProxyAddress(address) {
 
     // Methode 2: Via activity data (si l'adresse a déjà tradé)
     try {
-        const res = await fetch(`https://data-api.polymarket.com/activity?user=${addr}&limit=1`);
+        const res = await fetchWithTimeout(`https://data-api.polymarket.com/activity?user=${addr}&limit=1`);
         if (res.ok) {
             const data = await res.json();
             if (Array.isArray(data) && data.length > 0 && data[0].proxyWallet) {
@@ -252,6 +322,21 @@ async function initClobWithPrivateKey(privateKey, funderAddr) {
 // ============================================
 // COPY-TRADE EXECUTION
 // ============================================
+
+// Retry avec backoff pour l'envoi d'ordres (500ms, 1s, 2s)
+async function postOrderWithRetry(orderArgs, orderOpts, maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            const resp = await clobClient.createAndPostOrder(orderArgs, orderOpts);
+            return resp;
+        } catch (e) {
+            console.error(`Order attempt ${attempt}/${maxRetries} failed:`, e.message);
+            if (attempt === maxRetries) throw e;
+            await sleep(500 * attempt); // 500ms, 1s, 1.5s
+        }
+    }
+}
+
 async function executeCopyTrade(originalTrade, wallet) {
     if (!copyTradingEnabled || !clobClient) return;
 
@@ -283,7 +368,6 @@ async function executeCopyTrade(originalTrade, wallet) {
 
         // ============================================
         // PHASE 1: TOUT EN PARALLÈLE (balances + market info + tick size)
-        // Chaque appel réseau part en même temps → ~1 seul round-trip
         // ============================================
         const balancePromise = proportionalMode
             ? Promise.all([getUSDCBalance(wallet.address), getUSDCBalance(traderFunderAddress)])
@@ -293,7 +377,6 @@ async function executeCopyTrade(originalTrade, wallet) {
             ? fetchMarketInfo(conditionId)
             : Promise.resolve(null);
 
-        // Si on a déjà le tokenId, chercher le tick size en parallèle aussi
         const earlyTickPromise = assetId && clobClient
             ? getCachedTickSize(assetId)
             : Promise.resolve(null);
@@ -318,10 +401,16 @@ async function executeCopyTrade(originalTrade, wallet) {
             return;
         }
 
-        // Tick size (déjà résolu en parallèle, ou résoudre maintenant)
+        // --- Anti-doublon: cooldown par tokenId ---
+        const lastCopy = copyCooldowns.get(tokenId);
+        if (lastCopy && Date.now() - lastCopy < COPY_COOLDOWN_MS) {
+            console.log(`⏭️ Copy-trade ignoré: cooldown ${COPY_COOLDOWN_MS / 1000}s sur ce marché (${wallet.label})`);
+            return;
+        }
+
         const tickSize = earlyTickSize || await getCachedTickSize(tokenId);
 
-        // --- CALCUL DE LA TAILLE (proportionnel ou multiplicateur) ---
+        // --- CALCUL DE LA TAILLE ---
         let copyUsd;
         let sizingInfo = '';
         const [trackedBalance, myBalance] = balances;
@@ -349,16 +438,58 @@ async function executeCopyTrade(originalTrade, wallet) {
             return;
         }
 
-        // ============================================
-        // PHASE 2: EXÉCUTION IMMÉDIATE
-        // ============================================
         const side = isBuy ? 'BUY' : 'SELL';
-        const latencyMs = Date.now() - tradeStart;
 
-        const orderResp = await clobClient.createAndPostOrder(
+        // --- Check SELL: vérifier qu'on a des positions avant de vendre ---
+        if (side === 'SELL') {
+            try {
+                const positions = await clobClient.getBalanceAllowance({ asset_type: 'CONDITIONAL', token_id: tokenId });
+                const myShares = parseFloat(positions?.balance || '0');
+                if (myShares <= 0) {
+                    console.log(`⏭️ SELL ignoré: aucune position sur ce token (${wallet.label})`);
+                    await sendTelegram(`⏭️ *SELL ignoré*\n👤 ${wallet.label}\nAucune position à vendre sur ce marché`);
+                    return;
+                }
+                // Ne pas vendre plus que ce qu'on a
+                if (copySize > myShares) {
+                    console.log(`⚠️ SELL ajusté: ${copySize} → ${Math.floor(myShares)} shares (max dispo)`);
+                }
+            } catch (e) {
+                console.log(`⚠️ Position check failed, proceeding with SELL:`, e.message);
+            }
+        }
+
+        // --- Check slippage: comparer prix trader vs orderbook ---
+        let slippageInfo = '';
+        try {
+            const book = await clobClient.getOrderBook(tokenId);
+            const bestPrice = isBuy
+                ? (book?.asks?.[0]?.price ? parseFloat(book.asks[0].price) : null)
+                : (book?.bids?.[0]?.price ? parseFloat(book.bids[0].price) : null);
+
+            if (bestPrice && bestPrice > 0) {
+                const slippagePct = Math.abs(bestPrice - origPrice) / origPrice * 100;
+                if (slippagePct > CONFIG.SLIPPAGE_MAX_PCT) {
+                    slippageInfo = `⚠️ Slippage ${slippagePct.toFixed(1)}% (live ${(bestPrice * 100).toFixed(0)}¢ vs ${(origPrice * 100).toFixed(0)}¢)`;
+                    console.log(`⚠️ Slippage ${slippagePct.toFixed(1)}% détecté (${wallet.label})`);
+                    await sendTelegram(`⚠️ *Slippage élevé détecté!*\n\n👤 ${wallet.label}\n📊 ${side} - Prix trader: ${(origPrice * 100).toFixed(0)}¢ | Live: ${(bestPrice * 100).toFixed(0)}¢\nSlippage: *${slippagePct.toFixed(1)}%* (max ${CONFIG.SLIPPAGE_MAX_PCT}%)\n\n_Trade exécuté au prix live_`);
+                    // Exécuter au prix live plutôt qu'au prix stale
+                }
+            }
+        } catch (e) {
+            console.log('Slippage check skipped:', e.message);
+        }
+
+        // ============================================
+        // PHASE 2: EXÉCUTION AVEC RETRY
+        // ============================================
+        const orderResp = await postOrderWithRetry(
             { tokenID: tokenId, price: origPrice, size: copySize, side: side },
             { tickSize: tickSize, negRisk: negRisk }
         );
+
+        // Enregistrer le cooldown
+        copyCooldowns.set(tokenId, Date.now());
 
         const totalLatency = Date.now() - tradeStart;
         const market = originalTrade.title || originalTrade.question || originalTrade.market || 'Marché inconnu';
@@ -371,7 +502,7 @@ async function executeCopyTrade(originalTrade, wallet) {
             latencyMs: totalLatency,
         });
 
-        await sendTelegram(`✅ *Copy-trade exécuté!*\n\n👤 *${wallet.label}* → $${origUsdcSize.toFixed(2)}\n📊 *${side}* ${copySize} shares @ ${(origPrice * 100).toFixed(0)}¢\n💰 *$${(copySize * origPrice).toFixed(2)}*\n${sizingInfo}\n🏷️ ${market.slice(0, 60)}\n⚡ ${totalLatency}ms\n🆔 \`${orderResp.orderID || orderResp.id || 'OK'}\``);
+        await sendTelegram(`✅ *Copy-trade exécuté!*\n\n👤 *${wallet.label}* → $${origUsdcSize.toFixed(2)}\n📊 *${side}* ${copySize} shares @ ${(origPrice * 100).toFixed(0)}¢\n💰 *$${(copySize * origPrice).toFixed(2)}*\n${sizingInfo}\n🏷️ ${market.slice(0, 60)}\n⚡ ${totalLatency}ms${slippageInfo ? `\n${slippageInfo}` : ''}\n🆔 \`${orderResp.orderID || orderResp.id || 'OK'}\``);
 
     } catch (e) {
         console.error('❌ Copy-trade error:', e.message);
@@ -406,6 +537,8 @@ async function init() {
     telegramBot = new TelegramBot(CONFIG.TELEGRAM_BOT_TOKEN, { polling: true });
     setupTelegramCommands();
     scheduleDailySummary();
+    scheduleHeartbeat();
+    scheduleMemoryCleanup();
 
     const copyStatus = clobClient ? '🟢 Prêt' : '🔴 Non configuré';
 
@@ -471,7 +604,7 @@ function setupTelegramCommands() {
 
     // --- SET API KEY (key + secret + passphrase) ---
     telegramBot.onText(/\/setapi(?:@\S+)?\s+(\S+)\s+(\S+)\s+(\S+)/, async (msg, match) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         try { await telegramBot.deleteMessage(msg.chat.id, msg.message_id); } catch (e) {}
 
         const apiKey = match[1].trim();
@@ -501,7 +634,7 @@ function setupTelegramCommands() {
 
     // --- SET PRIVATE KEY ---
     telegramBot.onText(/\/setkey(?:@\S+)?\s+(\S+)/, async (msg, match) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         try { await telegramBot.deleteMessage(msg.chat.id, msg.message_id); } catch (e) {}
 
         const key = match[1].trim();
@@ -533,7 +666,7 @@ function setupTelegramCommands() {
 
     // --- SET FUNDER (proxy wallet) ---
     telegramBot.onText(/\/setfunder(?:@\S+)?\s+(\S+)/, async (msg, match) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         const addr = match[1].trim();
         if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) return await sendTelegram('❌ Adresse invalide.');
 
@@ -552,7 +685,7 @@ function setupTelegramCommands() {
 
     // --- MY ADDRESS (shows EOA vs proxy) ---
     telegramBot.onText(/\/myaddress/, async (msg) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
 
         if (!traderPrivateKey) {
             return await sendTelegram('❌ Pas de clé configurée.\n/setkey d\'abord.');
@@ -580,7 +713,7 @@ function setupTelegramCommands() {
 
     // --- LOOKUP (find proxy address for any wallet) ---
     telegramBot.onText(/\/lookup(?:@\S+)?\s+(\S+)/, async (msg, match) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         const addr = match[1].trim();
         if (!/^0x[a-fA-F0-9]{40}$/.test(addr)) return await sendTelegram('❌ Adresse invalide.');
 
@@ -599,7 +732,7 @@ function setupTelegramCommands() {
 
     // --- TOGGLE COPY ---
     telegramBot.onText(/\/copytrading/, async (msg) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         if (!clobClient) return await sendTelegram('❌ D\'abord /setkey');
 
         // Warn if proxy wallet is not properly set
@@ -618,7 +751,7 @@ function setupTelegramCommands() {
 
     // --- MULTIPLIER ---
     telegramBot.onText(/\/setmultiplier(?:@\S+)?\s+(.+)/, async (msg, match) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         const val = parseFloat(match[1]);
         if (isNaN(val) || val <= 0 || val > 100) return await sendTelegram('❌ Entre 0.01 et 100');
         copyMultiplier = val;
@@ -627,7 +760,7 @@ function setupTelegramCommands() {
 
     // --- MAX ---
     telegramBot.onText(/\/setmax(?:@\S+)?\s+(.+)/, async (msg, match) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         const val = parseFloat(match[1]);
         if (isNaN(val) || val <= 0) return await sendTelegram('❌ Invalide');
         maxCopyUSD = val;
@@ -636,7 +769,7 @@ function setupTelegramCommands() {
 
     // --- PROPORTIONAL MODE TOGGLE ---
     telegramBot.onText(/\/proportional/, async (msg) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         proportionalMode = !proportionalMode;
         const mode = proportionalMode ? '🟢 PROPORTIONNEL' : '🔴 MULTIPLICATEUR';
         const desc = proportionalMode
@@ -647,7 +780,7 @@ function setupTelegramCommands() {
 
     // --- BALANCE CHECK ---
     telegramBot.onText(/\/balance/, async (msg) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
 
         await sendTelegram('🔍 Lecture des balances USDC on-chain...');
 
@@ -683,7 +816,7 @@ function setupTelegramCommands() {
 
     // --- COPY HISTORY ---
     telegramBot.onText(/\/copyhistory/, async (msg) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         if (copiedTrades.length === 0) return await sendTelegram('📋 *Aucun copy-trade*');
 
         let txt = '📋 *Derniers copy-trades:*\n\n';
@@ -699,7 +832,7 @@ function setupTelegramCommands() {
 
     // --- SIG TYPE ---
     telegramBot.onText(/\/setsigtype(?:@\S+)?\s+(.+)/, async (msg, match) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         const val = parseInt(match[1], 10);
         if (![0, 1, 2].includes(val)) return await sendTelegram('❌ 0=EOA, 1=Magic, 2=Gnosis');
         signatureType = val;
@@ -709,7 +842,7 @@ function setupTelegramCommands() {
 
     // --- ADD WALLET ---
     telegramBot.onText(/\/add(?:@\S+)?\s+(\S+)\s*(.*)?/, async (msg, match) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         const address = match[1];
         const label = (match[2] || '').trim();
         if (!/^0x[a-fA-F0-9]{40}$/.test(address)) return await sendTelegram('❌ Adresse invalide.');
@@ -724,7 +857,7 @@ function setupTelegramCommands() {
 
     // --- REMOVE WALLET ---
     telegramBot.onText(/\/remove(?:@\S+)?\s+(.+)/, async (msg, match) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         const removed = removeWallet(match[1]);
         if (removed) {
             await sendTelegram(`🗑️ Supprimé: *${removed.label}*\n\`${removed.address}\`\nRestant: ${wallets.length}\n\n💡 Pensez à mettre à jour WALLETS sur Railway.`);
@@ -735,7 +868,7 @@ function setupTelegramCommands() {
 
     // --- LIST WALLETS ---
     telegramBot.onText(/\/wallets/, async (msg) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         if (wallets.length === 0) return await sendTelegram('📂 *Aucun wallet*\n`/add 0x... Nom`');
 
         let list = '📂 *Wallets suivis:*\n\n';
@@ -748,7 +881,7 @@ function setupTelegramCommands() {
 
     // --- START WATCH ---
     telegramBot.onText(/\/start_watch/, async (msg) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         if (isRunning) return await sendTelegram('⚠️ Déjà actif');
         if (wallets.length === 0) return await sendTelegram('❌ Aucun wallet. /add d\'abord');
 
@@ -760,23 +893,23 @@ function setupTelegramCommands() {
 
     // --- STOP WATCH ---
     telegramBot.onText(/\/stop_watch/, async (msg) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         isRunning = false;
         await sendTelegram('🔴 *Surveillance arrêtée*');
     });
 
     telegramBot.onText(/\/recent/, async (msg) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         await showRecentTrades();
     });
 
     telegramBot.onText(/\/summary/, async (msg) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         await sendDailySummary();
     });
 
     telegramBot.onText(/\/setmin(?:@\S+)?\s+(.+)/, async (msg, match) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         const value = parseFloat(match[1]);
         if (isNaN(value) || value < 0) return await sendTelegram('❌ Invalide');
         CONFIG.MIN_TRADE_USD = value;
@@ -785,7 +918,7 @@ function setupTelegramCommands() {
 
     // --- STATUS ---
     telegramBot.onText(/\/status/, async (msg) => {
-        if (msg.chat.id.toString() !== CONFIG.TELEGRAM_CHAT_ID) return;
+        if (!isAuthorized(msg)) return;
         const h = Math.floor(process.uptime() / 3600);
         const m = Math.floor((process.uptime() % 3600) / 60);
 
@@ -835,12 +968,18 @@ async function sendTelegram(message, options = {}) {
 // API
 // ============================================
 async function fetchActivity(walletAddress) {
+    if (circuitBreaker.isOpen()) return [];
     try {
-        const res = await fetch(
+        const res = await fetchWithTimeout(
             `https://data-api.polymarket.com/activity?user=${walletAddress.toLowerCase()}&limit=30`
         );
-        if (res.ok) return await res.json();
+        if (res.ok) {
+            circuitBreaker.recordSuccess();
+            return await res.json();
+        }
+        circuitBreaker.recordFailure();
     } catch (e) {
+        circuitBreaker.recordFailure();
         console.error(`API error (${walletAddress.slice(0, 8)}):`, e.message);
     }
     return [];
@@ -852,7 +991,7 @@ async function fetchMarketInfo(conditionId) {
     if (cached) return cached;
 
     try {
-        const res = await fetch(
+        const res = await fetchWithTimeout(
             `https://gamma-api.polymarket.com/markets?condition_id=${conditionId}`
         );
         if (res.ok) {
@@ -925,7 +1064,11 @@ async function startWatching() {
 }
 
 function getTradeId(t) {
-    return `${t.id || ''}-${t.transactionHash || t.transaction_hash || ''}-${t.timestamp || t.createdAt || ''}-${t.conditionId || t.asset_id || ''}`;
+    // Priorité au transactionHash (identifiant unique on-chain)
+    const txHash = t.transactionHash || t.transaction_hash;
+    if (txHash) return `tx-${txHash}`;
+    // Fallback: combinaison de champs
+    return `${t.id || ''}-${t.timestamp || t.createdAt || ''}-${t.conditionId || t.asset_id || ''}`;
 }
 
 async function checkAllWallets() {
@@ -1020,6 +1163,50 @@ Total: *$${usdcSize.toFixed(2)}*
 ⏰ ${timeStr}${marketLink ? `\n🔗 [Voir](${marketLink})` : ''}${copyTag}`);
 
     console.log(`📈 [${wallet.label}] ${emoji} - $${usdcSize.toFixed(2)} - ${market.slice(0, 40)}`);
+}
+
+// ============================================
+// HEARTBEAT (ping toutes les 6h pour confirmer que le bot est vivant)
+// ============================================
+function scheduleHeartbeat() {
+    const HEARTBEAT_INTERVAL = 6 * 60 * 60 * 1000; // 6h
+    setInterval(async () => {
+        const h = Math.floor(process.uptime() / 3600);
+        const m = Math.floor((process.uptime() % 3600) / 60);
+        const memMB = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
+        const knownCount = [...knownTrades.values()].reduce((s, set) => s + set.size, 0);
+        const cbStatus = circuitBreaker.isOpen() ? '🔴 Ouvert' : '🟢 OK';
+        await sendTelegram(`💓 *Heartbeat*\n\n• Uptime: ${h}h${m}m\n• RAM: ${memMB}MB\n• Surveillance: ${isRunning ? '🟢' : '🔴'}\n• Trades connus: ${knownCount}\n• Circuit breaker: ${cbStatus}\n• Copy: ${copyTradingEnabled ? '🟢' : '🔴'} (${copiedTrades.filter(c => c.success).length} OK)`);
+    }, HEARTBEAT_INTERVAL);
+}
+
+// ============================================
+// NETTOYAGE MÉMOIRE (empêche knownTrades de grossir sans limite)
+// ============================================
+function scheduleMemoryCleanup() {
+    const CLEANUP_INTERVAL = 4 * 60 * 60 * 1000; // 4h
+    const MAX_KNOWN_PER_WALLET = 500; // Garde les 500 derniers trades max
+    setInterval(() => {
+        let totalCleaned = 0;
+        for (const [addr, trades] of knownTrades.entries()) {
+            if (trades.size > MAX_KNOWN_PER_WALLET) {
+                const arr = [...trades];
+                const toKeep = arr.slice(-MAX_KNOWN_PER_WALLET);
+                knownTrades.set(addr, new Set(toKeep));
+                totalCleaned += arr.length - MAX_KNOWN_PER_WALLET;
+            }
+        }
+        // Nettoyer les cooldowns expirés
+        const now = Date.now();
+        for (const [tokenId, ts] of copyCooldowns.entries()) {
+            if (now - ts > COPY_COOLDOWN_MS * 2) copyCooldowns.delete(tokenId);
+        }
+        // Limiter copiedTrades à 200 entrées
+        if (copiedTrades.length > 200) {
+            copiedTrades = copiedTrades.slice(-100);
+        }
+        if (totalCleaned > 0) console.log(`🧹 Mémoire: ${totalCleaned} trades anciens supprimés`);
+    }, CLEANUP_INTERVAL);
 }
 
 // ============================================
