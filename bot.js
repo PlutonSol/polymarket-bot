@@ -10,7 +10,7 @@ const { ethers } = require('ethers');
 const CONFIG = {
     TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '8525426243:AAHfQdqz1jUD4algSX15z2SHvsziOG0rxxs',
     TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '410866851',
-    CHECK_INTERVAL: parseInt(process.env.CHECK_INTERVAL, 10) || 10000,
+    CHECK_INTERVAL: parseInt(process.env.CHECK_INTERVAL, 10) || 2000, // 2s pour latence minimale
     MIN_TRADE_USD: parseFloat(process.env.MIN_TRADE_USD) || 10,
     CLOB_HOST: 'https://clob.polymarket.com',
     CHAIN_ID: 137,
@@ -44,7 +44,11 @@ const USDC_ABI = ['function balanceOf(address) view returns (uint256)'];
 
 // Cache des balances (évite de spam le RPC)
 const balanceCache = new Map(); // address -> { balance, timestamp }
-const BALANCE_CACHE_TTL = 120000; // 2 minutes
+const BALANCE_CACHE_TTL = 60000; // 1 minute
+
+// Cache market info + tick sizes (évite des appels redondants)
+const marketInfoCache = new Map(); // conditionId -> data
+const tickSizeCache = new Map(); // tokenId -> tickSize
 
 async function getUSDCBalance(address) {
     const addr = address.toLowerCase();
@@ -261,6 +265,7 @@ async function executeCopyTrade(originalTrade, wallet) {
     }
 
     try {
+        const tradeStart = Date.now();
         const sideStr = (originalTrade.side || originalTrade.type || originalTrade.action || '').toLowerCase();
         const isBuy = sideStr.includes('buy') || sideStr.includes('bid');
 
@@ -269,34 +274,68 @@ async function executeCopyTrade(originalTrade, wallet) {
         const origUsdcSize = parseFloat(originalTrade.usdcSize || originalTrade.value || originalTrade.total || (origPrice * origSize) || 0);
 
         if (origPrice <= 0 || origSize <= 0) {
-            await sendTelegram(`⚠️ *Copy-trade ignoré*\nPrix ou taille invalide pour ${wallet.label}`);
+            console.log(`⏭️ Copy-trade ignoré: prix/taille invalide (${wallet.label})`);
             return;
         }
+
+        const conditionId = originalTrade.conditionId || originalTrade.condition_id;
+        const assetId = originalTrade.asset || originalTrade.asset_id || originalTrade.tokenId || originalTrade.token_id;
+
+        // ============================================
+        // PHASE 1: TOUT EN PARALLÈLE (balances + market info + tick size)
+        // Chaque appel réseau part en même temps → ~1 seul round-trip
+        // ============================================
+        const balancePromise = proportionalMode
+            ? Promise.all([getUSDCBalance(wallet.address), getUSDCBalance(traderFunderAddress)])
+            : Promise.resolve([null, null]);
+
+        const marketPromise = (!assetId && conditionId)
+            ? fetchMarketInfo(conditionId)
+            : Promise.resolve(null);
+
+        // Si on a déjà le tokenId, chercher le tick size en parallèle aussi
+        const earlyTickPromise = assetId && clobClient
+            ? getCachedTickSize(assetId)
+            : Promise.resolve(null);
+
+        const [balances, marketInfo, earlyTickSize] = await Promise.all([
+            balancePromise, marketPromise, earlyTickPromise
+        ]);
+
+        // --- Résoudre le token ID ---
+        let tokenId = assetId;
+        let negRisk = false;
+
+        if (!tokenId && marketInfo) {
+            negRisk = marketInfo.negRisk || false;
+            const tokenIds = JSON.parse(marketInfo.clobTokenIds || '[]');
+            const outcomeIdx = originalTrade.outcomeIndex ?? originalTrade.outcome_index ?? 0;
+            tokenId = tokenIds[outcomeIdx];
+        }
+
+        if (!tokenId) {
+            console.log(`⚠️ Copy-trade échoué: token ID introuvable (${wallet.label})`);
+            return;
+        }
+
+        // Tick size (déjà résolu en parallèle, ou résoudre maintenant)
+        const tickSize = earlyTickSize || await getCachedTickSize(tokenId);
 
         // --- CALCUL DE LA TAILLE (proportionnel ou multiplicateur) ---
         let copyUsd;
         let sizingInfo = '';
+        const [trackedBalance, myBalance] = balances;
 
-        if (proportionalMode) {
-            const [trackedBalance, myBalance] = await Promise.all([
-                getUSDCBalance(wallet.address),
-                getUSDCBalance(traderFunderAddress)
-            ]);
-
-            if (trackedBalance && trackedBalance > 0 && myBalance && myBalance > 0) {
-                const proportion = origUsdcSize / trackedBalance;
-                copyUsd = proportion * myBalance;
-                sizingInfo = `📐 Proportionnel: ${(proportion * 100).toFixed(1)}% de $${myBalance.toFixed(0)}`;
-                console.log(`Proportional: trader=$${trackedBalance.toFixed(0)} trade=$${origUsdcSize.toFixed(2)} (${(proportion * 100).toFixed(1)}%) → moi=$${myBalance.toFixed(0)} → copy=$${copyUsd.toFixed(2)}`);
-            } else {
-                // Fallback au multiplicateur si balances indisponibles
-                copyUsd = origUsdcSize * copyMultiplier;
-                sizingInfo = `⚠️ Balances indispo → fallback x${copyMultiplier}`;
-                console.log(`Proportional fallback: balance unavailable (tracked=${trackedBalance}, mine=${myBalance}), using multiplier x${copyMultiplier}`);
-            }
+        if (proportionalMode && trackedBalance && trackedBalance > 0 && myBalance && myBalance > 0) {
+            const proportion = origUsdcSize / trackedBalance;
+            copyUsd = proportion * myBalance;
+            sizingInfo = `📐 ${(proportion * 100).toFixed(1)}% de $${myBalance.toFixed(0)}`;
+            console.log(`⚡ Proportional: ${(proportion * 100).toFixed(1)}% → $${copyUsd.toFixed(2)}`);
         } else {
             copyUsd = origUsdcSize * copyMultiplier;
-            sizingInfo = `📐 Multiplicateur: x${copyMultiplier}`;
+            sizingInfo = proportionalMode
+                ? `⚠️ Balances indispo → x${copyMultiplier}`
+                : `📐 x${copyMultiplier}`;
         }
 
         if (copyUsd > maxCopyUSD) {
@@ -306,46 +345,22 @@ async function executeCopyTrade(originalTrade, wallet) {
         const copySize = Math.floor(copyUsd / origPrice);
 
         if (copySize <= 0) {
-            await sendTelegram(`⚠️ *Copy-trade ignoré*\nTaille trop petite après calcul\n${sizingInfo}`);
+            console.log(`⏭️ Copy-trade ignoré: taille trop petite (${wallet.label})`);
             return;
         }
 
-        const conditionId = originalTrade.conditionId || originalTrade.condition_id;
-        const assetId = originalTrade.asset || originalTrade.asset_id || originalTrade.tokenId || originalTrade.token_id;
-
-        let tokenId = assetId;
-        let negRisk = false;
-
-        if (!tokenId && conditionId) {
-            const marketInfo = await fetchMarketInfo(conditionId);
-            if (marketInfo) {
-                negRisk = marketInfo.negRisk || false;
-                const tokenIds = JSON.parse(marketInfo.clobTokenIds || '[]');
-                const outcomeIdx = originalTrade.outcomeIndex ?? originalTrade.outcome_index ?? 0;
-                tokenId = tokenIds[outcomeIdx];
-            }
-        }
-
-        if (!tokenId) {
-            await sendTelegram(`⚠️ *Copy-trade échoué*\nToken ID introuvable`);
-            return;
-        }
-
-        let tickSize = '0.01';
-        try {
-            tickSize = await clobClient.getTickSize(tokenId);
-        } catch (e) {
-            console.error('Tick size error:', e.message);
-        }
-
+        // ============================================
+        // PHASE 2: EXÉCUTION IMMÉDIATE
+        // ============================================
         const side = isBuy ? 'BUY' : 'SELL';
-        await sendTelegram(`🔄 *Copy-trade en cours...*\n👤 ${wallet.label} → $${origUsdcSize.toFixed(2)}\n📊 ${side} ${copySize} shares @ ${origPrice.toFixed(2)}\n💰 ~$${(copySize * origPrice).toFixed(2)}\n${sizingInfo}`);
+        const latencyMs = Date.now() - tradeStart;
 
         const orderResp = await clobClient.createAndPostOrder(
             { tokenID: tokenId, price: origPrice, size: copySize, side: side },
             { tickSize: tickSize, negRisk: negRisk }
         );
 
+        const totalLatency = Date.now() - tradeStart;
         const market = originalTrade.title || originalTrade.question || originalTrade.market || 'Marché inconnu';
 
         copiedTrades.push({
@@ -353,9 +368,10 @@ async function executeCopyTrade(originalTrade, wallet) {
             price: origPrice, size: copySize, usd: copySize * origPrice,
             market: market.slice(0, 50),
             orderId: orderResp.orderID || orderResp.id || 'N/A', success: true,
+            latencyMs: totalLatency,
         });
 
-        await sendTelegram(`✅ *Copy-trade exécuté!*\n\n👤 Copié de: *${wallet.label}*\n📊 *${side}* ${copySize} shares @ ${(origPrice * 100).toFixed(0)}¢\n💰 Total: *$${(copySize * origPrice).toFixed(2)}*\n${sizingInfo}\n🏷️ ${market.slice(0, 60)}\n🆔 \`${orderResp.orderID || orderResp.id || 'OK'}\``);
+        await sendTelegram(`✅ *Copy-trade exécuté!*\n\n👤 *${wallet.label}* → $${origUsdcSize.toFixed(2)}\n📊 *${side}* ${copySize} shares @ ${(origPrice * 100).toFixed(0)}¢\n💰 *$${(copySize * origPrice).toFixed(2)}*\n${sizingInfo}\n🏷️ ${market.slice(0, 60)}\n⚡ ${totalLatency}ms\n🆔 \`${orderResp.orderID || orderResp.id || 'OK'}\``);
 
     } catch (e) {
         console.error('❌ Copy-trade error:', e.message);
@@ -831,18 +847,50 @@ async function fetchActivity(walletAddress) {
 }
 
 async function fetchMarketInfo(conditionId) {
+    // Cache hit
+    const cached = marketInfoCache.get(conditionId);
+    if (cached) return cached;
+
     try {
         const res = await fetch(
             `https://gamma-api.polymarket.com/markets?condition_id=${conditionId}`
         );
         if (res.ok) {
             const data = await res.json();
-            if (Array.isArray(data) && data.length > 0) return data[0];
+            if (Array.isArray(data) && data.length > 0) {
+                marketInfoCache.set(conditionId, data[0]);
+                return data[0];
+            }
         }
     } catch (e) {
         console.error('Market info error:', e.message);
     }
     return null;
+}
+
+async function getCachedTickSize(tokenId) {
+    const cached = tickSizeCache.get(tokenId);
+    if (cached) return cached;
+
+    try {
+        const ts = await clobClient.getTickSize(tokenId);
+        tickSizeCache.set(tokenId, ts);
+        return ts;
+    } catch (e) {
+        console.error('Tick size error:', e.message);
+        return '0.01';
+    }
+}
+
+// Refresh les balances en background pour 0 latence pendant le trade
+let balanceRefreshInterval = null;
+function startBalanceRefresh() {
+    if (balanceRefreshInterval) return;
+    balanceRefreshInterval = setInterval(async () => {
+        if (!proportionalMode || !traderFunderAddress) return;
+        const addrs = [traderFunderAddress, ...wallets.map(w => w.address)];
+        await Promise.allSettled(addrs.map(a => getUSDCBalance(a)));
+    }, BALANCE_CACHE_TTL - 5000); // Refresh 5s avant expiration du cache
 }
 
 // ============================================
@@ -851,14 +899,18 @@ async function fetchMarketInfo(conditionId) {
 async function startWatching() {
     console.log('🔄 Démarrage surveillance...\n');
 
-    for (const w of wallets) {
+    // Charger les trades initiaux EN PARALLÈLE (pas séquentiel)
+    await Promise.allSettled(wallets.map(async (w) => {
         if (!knownTrades.has(w.address)) knownTrades.set(w.address, new Set());
         const initial = await fetchActivity(w.address);
         if (Array.isArray(initial)) {
             for (const t of initial) knownTrades.get(w.address).add(getTradeId(t));
         }
         console.log(`📊 ${w.label}: ${knownTrades.get(w.address).size} trades chargés`);
-    }
+    }));
+
+    // Lancer le refresh des balances en background
+    startBalanceRefresh();
 
     while (isRunning) {
         try {
@@ -877,10 +929,8 @@ function getTradeId(t) {
 }
 
 async function checkAllWallets() {
-    for (const w of wallets) {
-        if (!isRunning) break;
-        await checkNewTrades(w);
-    }
+    // Poll TOUS les wallets en parallèle (pas séquentiel)
+    await Promise.allSettled(wallets.map(w => isRunning ? checkNewTrades(w) : null));
 }
 
 async function checkNewTrades(wallet) {
@@ -905,8 +955,12 @@ async function checkNewTrades(wallet) {
         }
 
         dailyTrades.push({ ...t, usdcSize, walletLabel: wallet.label, walletAddress: wallet.address });
-        await notifyTrade(t, wallet);
-        await executeCopyTrade(t, wallet);
+        // Notification + exécution EN PARALLÈLE (pas de délai d'attente)
+        // Le trade part immédiatement, la notif Telegram ne le bloque pas
+        await Promise.all([
+            notifyTrade(t, wallet).catch(e => console.error('Notify error:', e.message)),
+            executeCopyTrade(t, wallet)
+        ]);
     }
 }
 
