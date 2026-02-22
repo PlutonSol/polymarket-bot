@@ -1,4 +1,6 @@
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
 const TelegramBot = require('node-telegram-bot-api');
 const { ClobClient } = require('@polymarket/clob-client');
 const { Wallet } = require('@ethersproject/wallet');
@@ -30,6 +32,68 @@ let isRunning = false;
 let knownTrades = new Map();
 let dailyTrades = [];
 let lastDailyReset = new Date().toDateString();
+
+// ============================================
+// PERSISTANCE D'ÉTAT (survit aux redémarrages Railway)
+// ============================================
+// Sauvegarde le dernier timestamp vu par wallet + les IDs des derniers trades
+// Au redémarrage, le bot ignore tout ce qui est plus ancien → pas de re-copy
+const STATE_FILE = path.join(__dirname, '.bot-state.json');
+
+function loadState() {
+    try {
+        if (fs.existsSync(STATE_FILE)) {
+            const data = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+            console.log(`💾 État restauré depuis ${STATE_FILE}`);
+            return data;
+        }
+    } catch (e) {
+        console.error('State load error:', e.message);
+    }
+    return { lastSeenTimestamps: {}, lastTradeIds: {} };
+}
+
+function saveState() {
+    try {
+        // Sauvegarder le dernier timestamp vu par wallet + les 50 derniers trade IDs
+        const state = { lastSeenTimestamps: {}, lastTradeIds: {} };
+        for (const [addr, trades] of knownTrades.entries()) {
+            const arr = [...trades];
+            state.lastTradeIds[addr] = arr.slice(-50); // Les 50 derniers IDs
+        }
+        for (const [addr, ts] of Object.entries(walletLastTimestamp)) {
+            state.lastSeenTimestamps[addr] = ts;
+        }
+        fs.writeFileSync(STATE_FILE, JSON.stringify(state), 'utf8');
+    } catch (e) {
+        console.error('State save error:', e.message);
+    }
+}
+
+// Timestamp du dernier trade vu par wallet (pour skip les trades anciens au boot)
+const walletLastTimestamp = {};
+
+// Sauvegarder l'état toutes les 60s (léger, juste un fichier JSON)
+let stateSaveInterval = null;
+function startStateSave() {
+    if (stateSaveInterval) return;
+    stateSaveInterval = setInterval(saveState, 60000);
+}
+
+// Graceful shutdown: sauvegarder l'état avant d'arrêter
+function setupGracefulShutdown() {
+    const shutdown = async (signal) => {
+        console.log(`\n🛑 ${signal} reçu, arrêt propre...`);
+        isRunning = false;
+        saveState();
+        try {
+            await sendTelegram(`🛑 *Bot arrêté* (${signal})\nÉtat sauvegardé.`);
+        } catch (e) {}
+        process.exit(0);
+    };
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
+}
 
 // ============================================
 // COPY-TRADING STATE
@@ -323,6 +387,69 @@ async function initClobWithPrivateKey(privateKey, funderAddr) {
 // COPY-TRADE EXECUTION
 // ============================================
 
+// ============================================
+// ORDER FILL VERIFICATION (asynchrone, ne bloque pas le flow)
+// ============================================
+// Après avoir posté un ordre, on vérifie en background s'il a été filled
+// Checks à 3s, 10s, 30s après le post
+const FILL_CHECK_DELAYS = [3000, 10000, 30000];
+
+async function checkOrderFill(orderId, tradeInfo) {
+    if (!orderId || !clobClient) return;
+
+    for (const delay of FILL_CHECK_DELAYS) {
+        await sleep(delay);
+        try {
+            const order = await clobClient.getOrder(orderId);
+            if (!order) continue;
+
+            const status = (order.status || '').toUpperCase();
+            const filledSize = parseFloat(order.size_matched || order.filledSize || order.matched || '0');
+            const totalSize = parseFloat(order.original_size || order.size || tradeInfo.size || '0');
+
+            if (status === 'MATCHED' || status === 'FILLED') {
+                // Mettre à jour le statut dans copiedTrades
+                const ct = copiedTrades.find(c => c.orderId === orderId);
+                if (ct) ct.fillStatus = 'FILLED';
+                console.log(`✅ Order ${orderId.slice(0, 8)} FILLED (${filledSize}/${totalSize})`);
+                return; // Tout bon
+            }
+
+            if (status === 'CANCELLED' || status === 'CANCELED' || status === 'EXPIRED') {
+                const ct = copiedTrades.find(c => c.orderId === orderId);
+                if (ct) { ct.fillStatus = status; ct.success = false; }
+                await sendTelegram(`❌ *Ordre ${status}!*\n\n👤 ${tradeInfo.wallet}\n📊 ${tradeInfo.side} ${tradeInfo.size} @ ${(tradeInfo.price * 100).toFixed(0)}¢\n🆔 \`${orderId.slice(0, 12)}\`\n\n_L'ordre n'a pas été exécuté._`);
+                return;
+            }
+
+            // Partiellement filled
+            if (filledSize > 0 && filledSize < totalSize) {
+                console.log(`⏳ Order ${orderId.slice(0, 8)} partial: ${filledSize}/${totalSize}`);
+            }
+        } catch (e) {
+            console.log(`Fill check error (${orderId.slice(0, 8)}):`, e.message);
+        }
+    }
+
+    // Après tous les checks, si toujours LIVE → alerter
+    try {
+        const order = await clobClient.getOrder(orderId);
+        const status = (order?.status || '').toUpperCase();
+        const filledSize = parseFloat(order?.size_matched || order?.filledSize || '0');
+
+        if (status === 'LIVE' || status === 'OPEN') {
+            const ct = copiedTrades.find(c => c.orderId === orderId);
+            if (ct) ct.fillStatus = 'PENDING';
+            await sendTelegram(`⏳ *Ordre toujours en attente*\n\n👤 ${tradeInfo.wallet}\n📊 ${tradeInfo.side} ${tradeInfo.size} @ ${(tradeInfo.price * 100).toFixed(0)}¢\nFilled: ${filledSize}/${tradeInfo.size}\n🆔 \`${orderId.slice(0, 12)}\`\n\n_L'ordre n'a pas été match après 30s._`);
+        } else if (status === 'MATCHED' || status === 'FILLED') {
+            const ct = copiedTrades.find(c => c.orderId === orderId);
+            if (ct) ct.fillStatus = 'FILLED';
+        }
+    } catch (e) {
+        console.log(`Final fill check error:`, e.message);
+    }
+}
+
 // Retry avec backoff pour l'envoi d'ordres (500ms, 1s, 2s)
 async function postOrderWithRetry(orderArgs, orderOpts, maxRetries = 3) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -504,6 +631,14 @@ async function executeCopyTrade(originalTrade, wallet) {
 
         await sendTelegram(`✅ *Copy-trade exécuté!*\n\n👤 *${wallet.label}* → $${origUsdcSize.toFixed(2)}\n📊 *${side}* ${copySize} shares @ ${(origPrice * 100).toFixed(0)}¢\n💰 *$${(copySize * origPrice).toFixed(2)}*\n${sizingInfo}\n🏷️ ${market.slice(0, 60)}\n⚡ ${totalLatency}ms${slippageInfo ? `\n${slippageInfo}` : ''}\n🆔 \`${orderResp.orderID || orderResp.id || 'OK'}\``);
 
+        // Vérification du fill en background (ne bloque pas)
+        const oid = orderResp.orderID || orderResp.id;
+        if (oid) {
+            checkOrderFill(oid, { wallet: wallet.label, side, size: copySize, price: origPrice }).catch(e =>
+                console.error('Fill check error:', e.message)
+            );
+        }
+
     } catch (e) {
         console.error('❌ Copy-trade error:', e.message);
         copiedTrades.push({ time: new Date().toISOString(), from: wallet.label, error: e.message, success: false });
@@ -517,6 +652,7 @@ async function executeCopyTrade(originalTrade, wallet) {
 async function init() {
     console.log('🚀 Bot Polymarket Copy-Trader (Railway)\n');
 
+    setupGracefulShutdown();
     loadWalletsFromEnv();
 
     // Auto-init CLOB: API Key prioritaire, sinon Private Key
@@ -1038,18 +1174,39 @@ function startBalanceRefresh() {
 async function startWatching() {
     console.log('🔄 Démarrage surveillance...\n');
 
+    // Restaurer l'état persisté (derniers trades connus)
+    const savedState = loadState();
+
     // Charger les trades initiaux EN PARALLÈLE (pas séquentiel)
     await Promise.allSettled(wallets.map(async (w) => {
         if (!knownTrades.has(w.address)) knownTrades.set(w.address, new Set());
+        const known = knownTrades.get(w.address);
+
+        // Restaurer les IDs sauvegardés (évite re-copy au redémarrage)
+        const savedIds = savedState.lastTradeIds[w.address] || [];
+        for (const id of savedIds) known.add(id);
+
+        // Restaurer le dernier timestamp vu
+        walletLastTimestamp[w.address] = savedState.lastSeenTimestamps[w.address] || 0;
+
         const initial = await fetchActivity(w.address);
         if (Array.isArray(initial)) {
-            for (const t of initial) knownTrades.get(w.address).add(getTradeId(t));
+            for (const t of initial) {
+                known.add(getTradeId(t));
+                // Mettre à jour le timestamp le plus récent
+                const ts = getTradeTimestamp(t);
+                if (ts > (walletLastTimestamp[w.address] || 0)) {
+                    walletLastTimestamp[w.address] = ts;
+                }
+            }
         }
-        console.log(`📊 ${w.label}: ${knownTrades.get(w.address).size} trades chargés`);
+        const restoredCount = savedIds.length;
+        console.log(`📊 ${w.label}: ${known.size} trades connus (${restoredCount} restaurés)`);
     }));
 
-    // Lancer le refresh des balances en background
+    // Lancer le refresh des balances en background + sauvegarde d'état
     startBalanceRefresh();
+    startStateSave();
 
     while (isRunning) {
         try {
@@ -1071,6 +1228,12 @@ function getTradeId(t) {
     return `${t.id || ''}-${t.timestamp || t.createdAt || ''}-${t.conditionId || t.asset_id || ''}`;
 }
 
+function getTradeTimestamp(t) {
+    const ts = t.timestamp || t.createdAt || t.created_at || t.time || 0;
+    if (typeof ts === 'number') return ts < 10000000000 ? ts * 1000 : ts;
+    try { return new Date(ts).getTime() || 0; } catch (e) { return 0; }
+}
+
 async function checkAllWallets() {
     // Poll TOUS les wallets en parallèle (pas séquentiel)
     await Promise.allSettled(wallets.map(w => isRunning ? checkNewTrades(w) : null));
@@ -1088,12 +1251,24 @@ async function checkNewTrades(wallet) {
         if (known.has(id)) continue;
         known.add(id);
 
+        // Mettre à jour le dernier timestamp vu
+        const tradeTs = getTradeTimestamp(t);
+        if (tradeTs > (walletLastTimestamp[wallet.address] || 0)) {
+            walletLastTimestamp[wallet.address] = tradeTs;
+        }
+
         const price = parseFloat(t.price || t.avgPrice || t.avg_price || 0);
         const size = parseFloat(t.size || t.amount || t.shares || 0);
         const usdcSize = parseFloat(t.usdcSize || t.value || t.total || (price * size) || 0);
 
         if (usdcSize < CONFIG.MIN_TRADE_USD) {
             console.log(`⏭️ [${wallet.label}] < $${CONFIG.MIN_TRADE_USD}: $${usdcSize.toFixed(2)}`);
+            continue;
+        }
+
+        // Ignorer les trades trop vieux (>5 min) pour éviter copy de trades retardés
+        if (tradeTs > 0 && Date.now() - tradeTs > 5 * 60 * 1000) {
+            console.log(`⏭️ [${wallet.label}] Trade trop ancien (${Math.round((Date.now() - tradeTs) / 1000)}s): $${usdcSize.toFixed(2)}`);
             continue;
         }
 

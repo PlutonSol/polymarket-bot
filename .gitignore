@@ -2,3 +2,4 @@ node_modules/
 .env
 wallets.json
 config.json
+.bot-state.json
