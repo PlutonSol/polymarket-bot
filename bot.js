@@ -16,7 +16,7 @@ const CONFIG = {
     CHECK_INTERVAL: parseInt(process.env.CHECK_INTERVAL, 10) || 2000,
     MIN_TRADE_USD: parseFloat(process.env.MIN_TRADE_USD) || 0,
     FETCH_TIMEOUT: parseInt(process.env.FETCH_TIMEOUT, 10) || 8000, // 8s timeout sur les fetch
-    SLIPPAGE_MAX_PCT: parseFloat(process.env.SLIPPAGE_MAX_PCT) || 3, // 3% slippage max
+    SLIPPAGE_MAX_PCT: parseFloat(process.env.SLIPPAGE_MAX_PCT) || 25, // 25% slippage max
     CLOB_HOST: 'https://clob.polymarket.com',
     CHAIN_ID: 137,
 };
