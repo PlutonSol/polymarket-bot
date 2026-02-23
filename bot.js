@@ -399,8 +399,8 @@ async function executeCopyTrade(originalTrade, wallet) {
         const origSize = parseFloat(originalTrade.size || originalTrade.amount || originalTrade.shares || 0);
         const origUsdcSize = parseFloat(originalTrade.usdcSize || originalTrade.value || originalTrade.total || (origPrice * origSize) || 0);
 
-        if (origPrice <= 0 || origSize <= 0) {
-            console.log(`⏭️ Copy-trade ignoré: prix/taille invalide (${wallet.label})`);
+        if (!Number.isFinite(origPrice) || !Number.isFinite(origSize) || origPrice <= 0 || origSize <= 0) {
+            console.log(`⏭️ Copy-trade ignoré: prix/taille invalide (${wallet.label}) price=${origPrice} size=${origSize}`);
             return;
         }
 
@@ -419,9 +419,13 @@ async function executeCopyTrade(originalTrade, wallet) {
         let negRisk = false;
         if (!tokenId && marketInfo) {
             negRisk = marketInfo.negRisk || false;
-            const tokenIds = JSON.parse(marketInfo.clobTokenIds || '[]');
-            const outcomeIdx = originalTrade.outcomeIndex ?? originalTrade.outcome_index ?? 0;
-            tokenId = tokenIds[outcomeIdx];
+            try {
+                const tokenIds = JSON.parse(marketInfo.clobTokenIds || '[]');
+                const outcomeIdx = originalTrade.outcomeIndex ?? originalTrade.outcome_index ?? 0;
+                tokenId = tokenIds[outcomeIdx];
+            } catch (e) {
+                console.log(`⚠️ clobTokenIds parse error (${wallet.label}):`, e.message);
+            }
         }
         if (!tokenId) {
             console.log(`⚠️ Copy-trade échoué: token ID introuvable (${wallet.label})`);
@@ -492,7 +496,7 @@ async function executeCopyTrade(originalTrade, wallet) {
             const bestPrice = isBuy
                 ? (book?.asks?.[0]?.price ? parseFloat(book.asks[0].price) : null)
                 : (book?.bids?.[0]?.price ? parseFloat(book.bids[0].price) : null);
-            if (bestPrice && bestPrice > 0) {
+            if (bestPrice && bestPrice > 0 && origPrice > 0) {
                 const slippagePct = Math.abs(bestPrice - origPrice) / origPrice * 100;
                 if (slippagePct > CONFIG.SLIPPAGE_MAX_PCT) {
                     slippageInfo = `slippage ${slippagePct.toFixed(1)}% (live ${(bestPrice * 100).toFixed(0)}¢ vs trader ${(origPrice * 100).toFixed(0)}¢)`;
@@ -811,7 +815,7 @@ function scheduleMemoryCleanup() {
 function startHealthServer() {
     const PORT = parseInt(process.env.PORT, 10) || 3000;
     const server = http.createServer((req, res) => {
-        if (req.url === '/health' || req.url === '/') {
+        if ((req.url === '/health' || req.url === '/') && req.method === 'GET') {
             const uptime = Math.floor(process.uptime());
             const memMB = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
             const status = isRunning && !circuitBreaker.isOpen() ? 'ok' : 'degraded';
@@ -821,6 +825,9 @@ function startHealthServer() {
             res.writeHead(404);
             res.end();
         }
+    });
+    server.on('error', (err) => {
+        console.error(`⚠️ Health server error (port ${PORT}):`, err.message);
     });
     server.listen(PORT, () => console.log(`🌐 Health check sur port ${PORT}`));
 }
