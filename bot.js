@@ -1,6 +1,7 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
 const { ClobClient } = require('@polymarket/clob-client');
 const { Wallet } = require('@ethersproject/wallet');
 const { ethers } = require('ethers');
@@ -77,7 +78,7 @@ function startStateSave() {
     stateSaveInterval = setInterval(saveState, 60000);
 }
 
-// Graceful shutdown
+// Graceful shutdown + crash safety
 function setupGracefulShutdown() {
     const shutdown = (signal) => {
         console.log(`\n🛑 ${signal} reçu, arrêt propre...`);
@@ -87,6 +88,17 @@ function setupGracefulShutdown() {
     };
     process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('SIGINT', () => shutdown('SIGINT'));
+
+    // Sauvegarder l'état même en cas de crash inattendu
+    process.on('unhandledRejection', (err) => {
+        console.error('❌ Unhandled rejection:', err?.message || err);
+        saveState();
+    });
+    process.on('uncaughtException', (err) => {
+        console.error('❌ Uncaught exception:', err?.message || err);
+        saveState();
+        process.exit(1);
+    });
 }
 
 // ============================================
@@ -95,6 +107,7 @@ function setupGracefulShutdown() {
 let copyTradingEnabled = true; // Activé par défaut
 let clobClient = null;
 let traderPrivateKey = null;
+let traderEOA = null; // Adresse EOA (conservée après nettoyage de la clé privée)
 let traderFunderAddress = process.env.POLYMARKET_FUNDER_ADDRESS || null;
 let signatureType = parseInt(process.env.SIGNATURE_TYPE, 10) || 0;
 let copyMultiplier = parseFloat(process.env.COPY_MULTIPLIER) || 1.0;
@@ -243,6 +256,7 @@ async function initClobWithApiKey(apiKey, apiSecret, apiPassphrase, privateKey, 
     try {
         const signer = new Wallet(privateKey);
         traderPrivateKey = privateKey;
+        traderEOA = signer.address.toLowerCase();
         if (funderAddr) {
             traderFunderAddress = funderAddr;
         } else {
@@ -273,6 +287,7 @@ async function initClobWithPrivateKey(privateKey, funderAddr) {
     try {
         const signer = new Wallet(privateKey);
         traderPrivateKey = privateKey;
+        traderEOA = signer.address.toLowerCase();
         if (funderAddr) {
             traderFunderAddress = funderAddr;
         } else {
@@ -370,13 +385,10 @@ async function postOrderWithRetry(orderArgs, orderOpts, maxRetries = 3) {
 async function executeCopyTrade(originalTrade, wallet) {
     if (!copyTradingEnabled || !clobClient) return;
 
-    // Vérifier que le proxy wallet est configuré
-    if (traderPrivateKey && traderFunderAddress) {
-        const signer = new Wallet(traderPrivateKey);
-        if (traderFunderAddress === signer.address.toLowerCase()) {
-            console.error('⚠️ Copy-trade bloqué: funder = EOA (pas le proxy Polymarket). Définissez POLYMARKET_FUNDER_ADDRESS.');
-            return;
-        }
+    // Vérifier que le proxy wallet est configuré (pas juste l'EOA)
+    if (traderEOA && traderFunderAddress && traderFunderAddress === traderEOA) {
+        console.error('⚠️ Copy-trade bloqué: funder = EOA (pas le proxy Polymarket). Définissez POLYMARKET_FUNDER_ADDRESS.');
+        return;
     }
 
     try {
@@ -442,7 +454,7 @@ async function executeCopyTrade(originalTrade, wallet) {
             sizingInfo += ` (cap $${maxCopyUSD})`;
             copyUsd = maxCopyUSD;
         }
-        const copySize = Math.floor(copyUsd / origPrice);
+        let copySize = Math.floor(copyUsd / origPrice);
         if (copySize <= 0) {
             console.log(`⏭️ Copy-trade ignoré: taille trop petite (${wallet.label})`);
             return;
@@ -450,7 +462,7 @@ async function executeCopyTrade(originalTrade, wallet) {
 
         const side = isBuy ? 'BUY' : 'SELL';
 
-        // Check SELL: vérifier positions
+        // Check SELL: vérifier positions et ajuster la taille
         if (side === 'SELL') {
             try {
                 const positions = await clobClient.getBalanceAllowance({ asset_type: 'CONDITIONAL', token_id: tokenId });
@@ -460,7 +472,12 @@ async function executeCopyTrade(originalTrade, wallet) {
                     return;
                 }
                 if (copySize > myShares) {
-                    console.log(`⚠️ SELL ajusté: ${copySize} → ${Math.floor(myShares)} shares`);
+                    console.log(`⚠️ SELL ajusté: ${copySize} → ${Math.floor(myShares)} shares (max dispo)`);
+                    copySize = Math.floor(myShares);
+                    if (copySize <= 0) {
+                        console.log(`⏭️ SELL ignoré: position trop petite après ajustement (${wallet.label})`);
+                        return;
+                    }
                 }
             } catch (e) {
                 console.log(`⚠️ Position check failed:`, e.message);
@@ -554,13 +571,15 @@ async function init() {
 
     scheduleMemoryCleanup();
     scheduleHeartbeat();
+    startHealthServer();
 
-    // Vérifier proxy wallet
-    if (traderPrivateKey) {
-        const signer = new Wallet(traderPrivateKey);
-        const isProxy = traderFunderAddress && traderFunderAddress !== signer.address.toLowerCase();
-        console.log(`🔐 EOA: ${maskAddr(signer.address.toLowerCase())} | Proxy: ${isProxy ? maskAddr(traderFunderAddress) + ' ✅' : '⚠️ NON CONFIGURÉ'}`);
+    // Vérifier proxy wallet, puis effacer la clé privée de la mémoire
+    if (traderEOA) {
+        const isProxy = traderFunderAddress && traderFunderAddress !== traderEOA;
+        console.log(`🔐 EOA: ${maskAddr(traderEOA)} | Proxy: ${isProxy ? maskAddr(traderFunderAddress) + ' ✅' : '⚠️ NON CONFIGURÉ'}`);
         console.log(`📐 Mode: ${proportionalMode ? 'Proportionnel' : `Multiplicateur x${copyMultiplier}`} | Max $${maxCopyUSD}`);
+        // Clé privée plus nécessaire: ClobClient a son propre signer
+        traderPrivateKey = null;
     }
 
     // Démarrage immédiat
@@ -784,6 +803,26 @@ function scheduleMemoryCleanup() {
         if (copiedTrades.length > 200) copiedTrades = copiedTrades.slice(-100);
         if (totalCleaned > 0) console.log(`🧹 Mémoire: ${totalCleaned} trades anciens supprimés`);
     }, CLEANUP_INTERVAL);
+}
+
+// ============================================
+// HEALTH CHECK (Railway peut vérifier que le bot est vivant)
+// ============================================
+function startHealthServer() {
+    const PORT = parseInt(process.env.PORT, 10) || 3000;
+    const server = http.createServer((req, res) => {
+        if (req.url === '/health' || req.url === '/') {
+            const uptime = Math.floor(process.uptime());
+            const memMB = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
+            const status = isRunning && !circuitBreaker.isOpen() ? 'ok' : 'degraded';
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status, uptime, memMB, copies: copiedTrades.length, wallets: wallets.length }));
+        } else {
+            res.writeHead(404);
+            res.end();
+        }
+    });
+    server.listen(PORT, () => console.log(`🌐 Health check sur port ${PORT}`));
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
