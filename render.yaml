@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: polymarket-bot
+    runtime: node
+    region: frankfurt
+    plan: free
+    buildCommand: npm install
+    startCommand: node bot.js
+    envVars:
+      - key: WALLETS
+        sync: false
+      - key: POLYMARKET_PRIVATE_KEY
+        sync: false
+      - key: POLYMARKET_FUNDER_ADDRESS
+        sync: false
