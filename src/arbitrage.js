@@ -4,15 +4,15 @@ const HyperliquidClient = require('./hyperliquid');
 const HyperEvmClient = require('./hyperEvm');
 
 /**
- * Moteur d'arbitrage entre Hyperliquid L1 (spot natif) et HyperEVM (DEX AMM)
+ * Moteur d'arbitrage HYPE: Hyperliquid L1 (spot) <-> HyperEVM (DEX AMM)
  *
- * Optimisations de vitesse:
- * - Prix HL + EVM récupérés en parallèle
- * - Exécution buy + sell en parallèle (pas séquentielle)
- * - Telegram non-bloquant (fire-and-forget)
- * - Pré-approval des tokens au démarrage
- * - Cache des decimals, paires, gas price
- * - Pas de re-fetch du gas pendant l'exécution
+ * Optimisé pour un seul token (HYPE):
+ * - Pas de boucle multi-token, appels directs
+ * - Prix HL + EVM en parallèle (2 appels RPC simultanés)
+ * - Buy + Sell en parallèle
+ * - Nonce management pour TX EVM parallèles
+ * - Circuit breaker: max loss + max trades/heure
+ * - Validation des balances avant exécution
  */
 class ArbitrageEngine {
     constructor(telegram) {
@@ -20,12 +20,14 @@ class ArbitrageEngine {
         this.evm = new HyperEvmClient();
         this.telegram = telegram;
         this.isRunning = false;
-        this.isExecuting = false; // Verrou pour éviter les exécutions concurrentes
+        this.isExecuting = false;
+        this.circuitBroken = false;
         this.stats = {
             scans: 0,
             opportunities: 0,
             trades: 0,
             totalProfit: 0,
+            totalLoss: 0,
             errors: 0,
             startTime: null,
             avgScanMs: 0,
@@ -34,46 +36,45 @@ class ArbitrageEngine {
             lastExecMs: 0,
         };
         this.lastOpportunities = [];
+        // Rate limiting: timestamps des trades récents
+        this.tradeTimestamps = [];
     }
 
-    /**
-     * Initialisation: pré-chauffe les caches et pré-approuve les tokens
-     */
     async warmup() {
         console.log('[ARB] Warming up...');
         await Promise.all([
-            this.evm.warmupCaches(),
+            this.evm.warmup(),
             this.evm.preApproveTokens(),
-            this.hl.getSpotMeta(), // Cache le spotMeta
+            this.hl.getSpotMeta(),
         ]);
         console.log('[ARB] Warmup complete');
     }
 
-    /**
-     * Démarre le scan d'arbitrage
-     */
     async start() {
         this.isRunning = true;
+        this.circuitBroken = false;
         this.stats.startTime = Date.now();
 
-        console.log(`\n[ARB] Engine started - scanning every ${CONFIG.SCAN_INTERVAL_MS}ms`);
+        console.log(`\n[ARB] Engine started - HYPE only`);
+        console.log(`[ARB] Scan interval: ${CONFIG.SCAN_INTERVAL_MS}ms`);
         console.log(`[ARB] Min spread: ${CONFIG.MIN_SPREAD_PCT}%`);
         console.log(`[ARB] Trade size: $${CONFIG.TRADE_SIZE_USDC}`);
-        console.log(`[ARB] Dry run: ${CONFIG.DRY_RUN}`);
-        console.log(`[ARB] Tokens: ${CONFIG.TOKENS.map(t => t.symbol).join(', ')}\n`);
+        console.log(`[ARB] Max loss: $${CONFIG.MAX_LOSS_USD}`);
+        console.log(`[ARB] Max trades/h: ${CONFIG.MAX_TRADES_PER_HOUR}`);
+        console.log(`[ARB] Mode: ${CONFIG.DRY_RUN ? 'DRY RUN' : 'LIVE'}\n`);
 
-        // Warmup avant de démarrer le scan
         await this.warmup();
 
         while (this.isRunning) {
+            if (this.circuitBroken) {
+                await this._sleep(10000); // Ralentir quand le circuit breaker est actif
+                continue;
+            }
             try {
                 await this.scan();
             } catch (e) {
                 this.stats.errors++;
                 console.error('[ARB] Scan error:', e.message);
-                if (this.stats.errors > 10 && this.stats.scans < 20) {
-                    console.error('[ARB] Too many errors early on, check config');
-                }
             }
             await this._sleep(CONFIG.SCAN_INTERVAL_MS);
         }
@@ -85,28 +86,19 @@ class ArbitrageEngine {
     }
 
     /**
-     * Scan toutes les paires configurées.
-     * Optimisé: tous les tokens sont scannés en parallèle.
+     * Scan HYPE uniquement. Pas de boucle, appels directs.
      */
     async scan() {
         this.stats.scans++;
         const scanStart = Date.now();
 
-        // Scanner tous les tokens en parallèle
-        const results = await Promise.allSettled(
-            CONFIG.TOKENS.map(token => this.checkArbitrage(token))
-        );
+        const opportunity = await this.checkArbitrage();
 
-        for (const result of results) {
-            if (result.status === 'fulfilled' && result.value) {
-                const opportunity = result.value;
-                this.stats.opportunities++;
-                this.lastOpportunities.unshift(opportunity);
-                if (this.lastOpportunities.length > 50) {
-                    this.lastOpportunities.pop();
-                }
-                await this.handleOpportunity(opportunity);
-            }
+        if (opportunity) {
+            this.stats.opportunities++;
+            this.lastOpportunities.unshift(opportunity);
+            if (this.lastOpportunities.length > 50) this.lastOpportunities.pop();
+            await this.handleOpportunity(opportunity);
         }
 
         const scanMs = Date.now() - scanStart;
@@ -115,74 +107,61 @@ class ArbitrageEngine {
             ? (this.stats.avgScanMs * 0.9 + scanMs * 0.1)
             : scanMs;
 
-        // Log périodique
-        if (this.stats.scans % 100 === 0) {
-            console.log(`[ARB] Scans: ${this.stats.scans} | Opps: ${this.stats.opportunities} | Trades: ${this.stats.trades} | Avg scan: ${this.stats.avgScanMs.toFixed(0)}ms`);
+        if (this.stats.scans % 200 === 0) {
+            console.log(`[ARB] Scans: ${this.stats.scans} | Opps: ${this.stats.opportunities} | Trades: ${this.stats.trades} | Avg: ${this.stats.avgScanMs.toFixed(0)}ms`);
         }
     }
 
     /**
-     * Vérifie s'il y a une opportunité d'arbitrage pour un token.
-     * Optimisé: prix HL et EVM récupérés en parallèle.
+     * Check arbitrage HYPE: prix HL + EVM récupérés en parallèle.
      */
-    async checkArbitrage(token) {
-        // Récupérer les prix HL + EVM en parallèle
+    async checkArbitrage() {
+        // 2 appels en parallèle: orderbook HL + reserves EVM + gas cache
         const [hlData, evmData, gasData] = await Promise.all([
-            this.hl.getSpotBestBidAsk(token.hyperliquidName),
-            this.evm.getTokenPriceFromPair(token.evmAddress),
-            this.evm.getGasPrice(), // Depuis le cache (refresh 10s)
+            this.hl.getHypeBestBidAsk(),
+            this.evm.getHypePrice(),
+            this.evm.getGasPrice(),
         ]);
 
-        if (!hlData || !hlData.bestBid || !hlData.bestAsk) {
-            if (CONFIG.LOG_LEVEL === 'debug') {
-                console.log(`[ARB] No HL data for ${token.symbol}`);
-            }
-            return null;
-        }
-        if (!evmData) {
-            if (CONFIG.LOG_LEVEL === 'debug') {
-                console.log(`[ARB] No EVM data for ${token.symbol}`);
-            }
-            return null;
-        }
+        if (!hlData || !hlData.bestBid || !hlData.bestAsk) return null;
+        if (!evmData) return null;
 
         const hlMid = (hlData.bestBid + hlData.bestAsk) / 2;
         const evmPrice = evmData.price;
-
         const spread = ((evmPrice - hlMid) / hlMid) * 100;
         const absSpread = Math.abs(spread);
 
         if (CONFIG.LOG_LEVEL === 'debug') {
-            console.log(`[ARB] ${token.symbol}: HL=${hlMid.toFixed(4)} EVM=${evmPrice.toFixed(4)} Spread=${spread.toFixed(3)}%`);
+            console.log(`[ARB] HYPE: HL=$${hlMid.toFixed(4)} EVM=$${evmPrice.toFixed(4)} Spread=${spread.toFixed(3)}%`);
         }
 
-        if (absSpread < CONFIG.MIN_SPREAD_PCT) {
-            return null;
-        }
+        if (absSpread < CONFIG.MIN_SPREAD_PCT) return null;
 
-        // Calculer le prix effectif avec slippage
+        // Prix effectif avec slippage (passe les réserves pour éviter un 2e appel)
+        const direction = spread > 0 ? 'sell' : 'buy';
         const effectiveData = await this.evm.getEffectivePrice(
-            token.evmAddress,
             CONFIG.TRADE_SIZE_USDC,
-            spread > 0 ? 'sell' : 'buy'
+            direction,
+            evmData
         );
 
-        // Estimer les frais de gas
         const estimatedGasCost = gasData.gasPriceGwei * 250000 / 1e9;
 
-        let direction, buyPrice, sellPrice, buyVenue, sellVenue;
+        let buyPrice, sellPrice, buyVenue, sellVenue, arbDirection;
 
         if (spread > 0) {
-            direction = 'BUY_HL_SELL_EVM';
+            // EVM plus cher → acheter HL, vendre EVM
+            arbDirection = 'BUY_HL_SELL_EVM';
             buyPrice = hlData.bestAsk;
             sellPrice = effectiveData ? effectiveData.effectivePrice : evmPrice;
             buyVenue = 'Hyperliquid';
-            sellVenue = 'HyperEVM DEX';
+            sellVenue = 'HyperEVM';
         } else {
-            direction = 'BUY_EVM_SELL_HL';
+            // HL plus cher → acheter EVM, vendre HL
+            arbDirection = 'BUY_EVM_SELL_HL';
             buyPrice = effectiveData ? effectiveData.effectivePrice : evmPrice;
             sellPrice = hlData.bestBid;
-            buyVenue = 'HyperEVM DEX';
+            buyVenue = 'HyperEVM';
             sellVenue = 'Hyperliquid';
         }
 
@@ -191,15 +170,15 @@ class ArbitrageEngine {
         const netProfit = grossProfit - estimatedGasCost;
         const netSpreadPct = (netProfit / CONFIG.TRADE_SIZE_USDC) * 100;
 
-        const hasLiquidity = this._checkLiquidity(
-            direction === 'BUY_HL_SELL_EVM' ? hlData.askSize : evmData.tokenReserve,
-            tokenAmount
-        );
+        const availableSize = arbDirection === 'BUY_HL_SELL_EVM'
+            ? hlData.askSize
+            : evmData.hypeReserve;
+        const hasLiquidity = availableSize >= tokenAmount * 1.1;
 
         return {
             timestamp: new Date().toISOString(),
-            token: token.symbol,
-            direction,
+            token: 'HYPE',
+            direction: arbDirection,
             buyVenue,
             sellVenue,
             hlBid: hlData.bestBid,
@@ -222,139 +201,127 @@ class ArbitrageEngine {
         };
     }
 
-    /**
-     * Gère une opportunité d'arbitrage détectée.
-     * Optimisé: Telegram est fire-and-forget (non-bloquant).
-     */
     async handleOpportunity(opp) {
-        const profitEmoji = opp.profitable ? '💰' : '👀';
-        const dirEmoji = opp.direction === 'BUY_HL_SELL_EVM' ? '➡️' : '⬅️';
+        console.log(`\n${opp.profitable ? '💰' : '👀'} [ARB] HYPE ${opp.direction}`);
+        console.log(`  Buy $${opp.buyPrice.toFixed(4)} (${opp.buyVenue}) → Sell $${opp.sellPrice.toFixed(4)} (${opp.sellVenue})`);
+        console.log(`  Spread: ${opp.spread.toFixed(3)}% | Net: $${opp.netProfit.toFixed(4)}`);
 
-        console.log(`\n${profitEmoji} [ARB] Opportunity: ${opp.token}`);
-        console.log(`  ${dirEmoji} ${opp.direction}`);
-        console.log(`  Buy @ ${opp.buyPrice.toFixed(4)} (${opp.buyVenue})`);
-        console.log(`  Sell @ ${opp.sellPrice.toFixed(4)} (${opp.sellVenue})`);
-        console.log(`  Spread: ${opp.spread.toFixed(3)}% | Net: ${opp.netSpread.toFixed(3)}%`);
-        console.log(`  Profit: $${opp.grossProfit.toFixed(4)} - $${opp.gasCost.toFixed(4)} gas = $${opp.netProfit.toFixed(4)}`);
-
-        // Telegram en fire-and-forget (ne bloque PAS l'exécution)
+        // Telegram non-bloquant
         this.telegram.sendOpportunity(opp).catch(() => {});
 
         if (opp.profitable && !CONFIG.DRY_RUN) {
             await this.executeArbitrage(opp);
         } else if (opp.profitable && CONFIG.DRY_RUN) {
-            console.log(`  [DRY-RUN] Would execute trade for $${opp.netProfit.toFixed(4)} profit`);
+            console.log(`  [DRY-RUN] Would trade for $${opp.netProfit.toFixed(4)} profit`);
         }
     }
 
     /**
-     * Exécute l'arbitrage.
-     * Optimisé:
-     * - Buy + Sell en PARALLÈLE (pas séquentiel)
-     * - Pas de re-check du gas (déjà vérifié pendant le scan)
-     * - Pas d'allowance check (pré-approuvé au démarrage)
-     * - Verrou anti-exécution concurrente
+     * Exécute l'arbitrage avec toutes les protections:
+     * - Verrou anti-concurrence
+     * - Circuit breaker (max loss)
+     * - Rate limiting (max trades/heure)
+     * - Validation du slippage
+     * - Buy + Sell en parallèle
+     * - Nonce management
      */
     async executeArbitrage(opp) {
-        // Verrou: une seule exécution à la fois
         if (this.isExecuting) {
-            console.log('[ARB] Already executing, skipping');
+            console.log('[ARB] Already executing, skip');
             return;
         }
+
+        // Circuit breaker check
+        if (this.stats.totalLoss > CONFIG.MAX_LOSS_USD) {
+            if (!this.circuitBroken) {
+                this.circuitBroken = true;
+                console.error(`[ARB] CIRCUIT BREAKER: loss $${this.stats.totalLoss.toFixed(2)} > max $${CONFIG.MAX_LOSS_USD}`);
+                this.telegram.sendError(`CIRCUIT BREAKER: loss $${this.stats.totalLoss.toFixed(2)} > max $${CONFIG.MAX_LOSS_USD}`).catch(() => {});
+            }
+            return;
+        }
+
+        // Rate limiting
+        const oneHourAgo = Date.now() - 3600000;
+        this.tradeTimestamps = this.tradeTimestamps.filter(t => t > oneHourAgo);
+        if (this.tradeTimestamps.length >= CONFIG.MAX_TRADES_PER_HOUR) {
+            console.log(`[ARB] Rate limited: ${this.tradeTimestamps.length} trades in last hour`);
+            return;
+        }
+
+        // Slippage check
+        if (opp.priceImpact > CONFIG.MAX_SLIPPAGE_PCT) {
+            console.log(`[ARB] Slippage too high: ${opp.priceImpact.toFixed(3)}%`);
+            return;
+        }
+
         this.isExecuting = true;
         const execStart = Date.now();
 
-        console.log(`\n🔥 [ARB] Executing arbitrage: ${opp.direction}`);
+        console.log(`\n🔥 [ARB] Executing: ${opp.direction}`);
 
         try {
-            // Vérifier le slippage
-            if (opp.priceImpact > CONFIG.MAX_SLIPPAGE_PCT) {
-                console.log(`[ARB] Slippage too high: ${opp.priceImpact}% > ${CONFIG.MAX_SLIPPAGE_PCT}% max`);
-                return;
-            }
-
-            const tokenConfig = CONFIG.TOKENS.find(t => t.symbol === opp.token);
             let hlPromise, evmPromise;
 
             if (opp.direction === 'BUY_EVM_SELL_HL') {
-                const usdcDecimals = 6;
-                const amountIn = ethers.parseUnits(opp.tradeSize.toString(), usdcDecimals);
+                const amountIn = ethers.parseUnits(opp.tradeSize.toString(), this.evm.usdcDecimals);
                 const minOut = ethers.parseUnits(
                     (opp.tokenAmount * (1 - CONFIG.MAX_SLIPPAGE_PCT / 100)).toFixed(8),
-                    tokenConfig.decimals
+                    18
                 );
 
-                // PARALLÈLE: acheter EVM + vendre HL en même temps
-                evmPromise = this.evm.executeSwap(
-                    opp.token,
-                    amountIn,
-                    minOut,
-                    [CONFIG.USDC_ADDRESS, tokenConfig.evmAddress]
-                );
-
+                evmPromise = this.evm.executeSwap(amountIn, minOut, this.evm.pathBuyHype);
                 hlPromise = this.hl.placeSpotOrder({
-                    symbol: opp.token,
                     isBuy: false,
                     size: opp.tokenAmount,
                     price: opp.hlBid,
                 });
             } else {
-                // BUY_HL_SELL_EVM
-                const amountIn = ethers.parseUnits(
-                    opp.tokenAmount.toFixed(8),
-                    tokenConfig.decimals
-                );
+                const amountIn = ethers.parseUnits(opp.tokenAmount.toFixed(8), 18);
                 const minOut = ethers.parseUnits(
                     (opp.tradeSize * (1 - CONFIG.MAX_SLIPPAGE_PCT / 100)).toFixed(6),
-                    6
+                    this.evm.usdcDecimals
                 );
 
-                // PARALLÈLE: acheter HL + vendre EVM en même temps
                 hlPromise = this.hl.placeSpotOrder({
-                    symbol: opp.token,
                     isBuy: true,
                     size: opp.tokenAmount,
                     price: opp.hlAsk,
                 });
-
-                evmPromise = this.evm.executeSwap(
-                    opp.token,
-                    amountIn,
-                    minOut,
-                    [tokenConfig.evmAddress, CONFIG.USDC_ADDRESS]
-                );
+                evmPromise = this.evm.executeSwap(amountIn, minOut, this.evm.pathSellHype);
             }
 
-            // Attendre les deux résultats en parallèle
             const [evmResult, hlResult] = await Promise.all([evmPromise, hlPromise]);
 
             const execMs = Date.now() - execStart;
             this.stats.trades++;
-            this.stats.totalProfit += opp.netProfit;
+            this.tradeTimestamps.push(Date.now());
+
+            if (opp.netProfit >= 0) {
+                this.stats.totalProfit += opp.netProfit;
+            } else {
+                this.stats.totalLoss += Math.abs(opp.netProfit);
+            }
+
             this.stats.lastExecMs = execMs;
             this.stats.avgExecMs = this.stats.avgExecMs
                 ? (this.stats.avgExecMs * 0.9 + execMs * 0.1)
                 : execMs;
 
-            console.log(`✅ [ARB] Trade executed in ${execMs}ms!`);
-            console.log(`  EVM: ${JSON.stringify(evmResult)}`);
-            console.log(`  HL: ${JSON.stringify(hlResult)}`);
-
-            // Telegram en fire-and-forget
+            console.log(`✅ [ARB] Executed in ${execMs}ms`);
             this.telegram.sendTradeExecution(opp, { evmResult, hlResult, execMs }).catch(() => {});
 
         } catch (e) {
             this.stats.errors++;
             const execMs = Date.now() - execStart;
-            console.error(`❌ [ARB] Trade execution error (${execMs}ms):`, e.message);
+            console.error(`❌ [ARB] Execution failed (${execMs}ms):`, e.message);
             this.telegram.sendError(`Trade failed (${execMs}ms): ${e.message}`).catch(() => {});
+
+            // Resync nonce après une erreur
+            await this.evm.resyncNonce();
         } finally {
             this.isExecuting = false;
         }
-    }
-
-    _checkLiquidity(availableSize, neededSize) {
-        return availableSize >= neededSize * 1.1;
     }
 
     getStats() {
@@ -372,11 +339,19 @@ class ArbitrageEngine {
             successRate: this.stats.scans > 0
                 ? ((this.stats.opportunities / this.stats.scans) * 100).toFixed(2) + '%'
                 : '0%',
+            circuitBroken: this.circuitBroken,
+            tradesLastHour: this.tradeTimestamps.filter(t => t > Date.now() - 3600000).length,
         };
     }
 
     getRecentOpportunities(count = 5) {
         return this.lastOpportunities.slice(0, count);
+    }
+
+    resetCircuitBreaker() {
+        this.circuitBroken = false;
+        this.stats.totalLoss = 0;
+        console.log('[ARB] Circuit breaker reset');
     }
 
     _sleep(ms) {

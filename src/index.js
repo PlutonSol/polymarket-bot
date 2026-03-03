@@ -3,156 +3,101 @@ const CONFIG = require('./config');
 const ArbitrageEngine = require('./arbitrage');
 const TelegramNotifier = require('./telegram');
 
-/**
- * Bot d'arbitrage Hyperliquid (L1 spot) <-> HyperEVM (DEX AMM)
- *
- * Architecture:
- * ┌─────────────────────────────────────────────┐
- * │             Arbitrage Engine                 │
- * │                                              │
- * │  ┌──────────────┐    ┌───────────────────┐   │
- * │  │ Hyperliquid   │    │  HyperEVM DEX     │   │
- * │  │ (Spot L1)     │    │  (AMM on-chain)   │   │
- * │  │               │    │                   │   │
- * │  │ - Prix bid/ask│    │ - Prix reserves   │   │
- * │  │ - Place orders│    │ - Swap tokens     │   │
- * │  └──────────────┘    └───────────────────┘   │
- * │           │                    │              │
- * │           └──── Compare ───────┘              │
- * │                    │                          │
- * │            Si spread > seuil                  │
- * │           ┌────────┴────────┐                 │
- * │           │ Execute Arb     │                 │
- * │           │ Buy low/Sell hi │                 │
- * │           └────────┬────────┘                 │
- * │                    │                          │
- * │           ┌────────┴────────┐                 │
- * │           │ Telegram Alert  │                 │
- * │           └─────────────────┘                 │
- * └─────────────────────────────────────────────┘
- *
- * Usage:
- *   1. Copier .env.example → .env
- *   2. Remplir les variables d'environnement
- *   3. npm install
- *   4. npm start
- *   5. Sur Telegram: /start_arb pour démarrer
- */
-
 async function main() {
-    console.log('='.repeat(50));
-    console.log('  Bot Arbitrage Hyperliquid / HyperEVM');
-    console.log('='.repeat(50));
-    console.log();
+    console.log('==================================================');
+    console.log('  Bot Arbitrage HYPE: Hyperliquid ↔ HyperEVM');
+    console.log('==================================================\n');
 
-    // Validation de la config
     validateConfig();
 
-    // Initialiser les modules
     const telegram = new TelegramNotifier();
     const arbEngine = new ArbitrageEngine(telegram);
-
-    // Connecter les modules
     telegram.init(arbEngine);
 
-    // Message de démarrage
-    await telegram.send(`🤖 *Bot Arbitrage Hyperliquid/HyperEVM*
+    await telegram.send(`🤖 *Bot Arbitrage HYPE*
+Hyperliquid L1 ↔ HyperEVM DEX
 
-✅ Bot initialisé et prêt
-
-⚙️ *Configuration:*
+⚙️ *Config:*
 • Spread min: ${CONFIG.MIN_SPREAD_PCT}%
-• Taille trade: $${CONFIG.TRADE_SIZE_USDC}
+• Taille: $${CONFIG.TRADE_SIZE_USDC}
 • Slippage max: ${CONFIG.MAX_SLIPPAGE_PCT}%
+• Max loss: $${CONFIG.MAX_LOSS_USD}
+• Scan: ${CONFIG.SCAN_INTERVAL_MS}ms
 • Mode: ${CONFIG.DRY_RUN ? '🧪 Dry Run' : '🔴 LIVE'}
-• Tokens: ${CONFIG.TOKENS.map(t => t.symbol).join(', ')}
-• Intervalle: ${CONFIG.SCAN_INTERVAL_MS}ms
 
-📋 *Commandes:*
-/start\\_arb - Démarrer
-/stop\\_arb - Arrêter
-/stats - Statistiques
-/opps - Opportunités
-/prices - Prix
-/help - Aide
+/start\\_arb pour démarrer`);
 
-Tapez /start\\_arb pour commencer le scan.`);
-
-    // Si AUTO_START est défini, démarrer automatiquement
     if (process.env.AUTO_START === 'true') {
-        console.log('[MAIN] Auto-starting arbitrage engine...');
+        console.log('[MAIN] Auto-starting...');
         arbEngine.start();
     }
 
-    // Gérer l'arrêt propre
     const shutdown = async (signal) => {
-        console.log(`\n[MAIN] ${signal} received, shutting down...`);
+        console.log(`\n[MAIN] ${signal} received`);
         arbEngine.stop();
         const stats = arbEngine.getStats();
         await telegram.send(`🔴 *Bot arrêté* (${signal})
 
-📊 Session:
 • Durée: ${stats.uptimeStr}
 • Scans: ${stats.scans}
-• Opportunités: ${stats.opportunities}
 • Trades: ${stats.trades}
-• Profit: $${stats.totalProfit.toFixed(4)}`);
-
+• Profit: $${stats.totalProfit.toFixed(4)}
+• Pertes: $${stats.totalLoss.toFixed(4)}`);
         process.exit(0);
     };
 
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-    // Garder le process actif
-    console.log('[MAIN] Bot ready. Waiting for Telegram commands...\n');
+    console.log('[MAIN] Ready. Waiting for /start_arb on Telegram.\n');
 }
 
-/**
- * Valide la configuration minimale
- */
 function validateConfig() {
     const warnings = [];
     const errors = [];
 
     if (!CONFIG.PRIVATE_KEY) {
-        warnings.push('PRIVATE_KEY non défini - trades désactivés');
+        warnings.push('PRIVATE_KEY not set - trades disabled');
     }
 
     if (!CONFIG.TELEGRAM_BOT_TOKEN) {
-        warnings.push('TELEGRAM_BOT_TOKEN non défini - notifications par console uniquement');
+        warnings.push('TELEGRAM_BOT_TOKEN not set - console only');
+    }
+
+    if (CONFIG.TELEGRAM_BOT_TOKEN && !CONFIG.TELEGRAM_CHAT_ID) {
+        errors.push('TELEGRAM_CHAT_ID must be set when TELEGRAM_BOT_TOKEN is configured (security)');
     }
 
     if (!CONFIG.DEX_ROUTER_ADDRESS) {
-        warnings.push('DEX_ROUTER_ADDRESS non défini - swaps EVM désactivés');
+        warnings.push('DEX_ROUTER_ADDRESS not set - EVM swaps disabled');
     }
 
     if (!CONFIG.DEX_FACTORY_ADDRESS) {
-        warnings.push('DEX_FACTORY_ADDRESS non défini - lecture des paires désactivée');
-    }
-
-    if (CONFIG.TOKENS.length === 0) {
-        errors.push('Aucun token configuré dans TOKENS');
+        warnings.push('DEX_FACTORY_ADDRESS not set - pair lookup disabled');
     }
 
     if (!CONFIG.DRY_RUN && !CONFIG.PRIVATE_KEY) {
-        errors.push('Mode LIVE activé mais PRIVATE_KEY non défini!');
+        errors.push('LIVE mode requires PRIVATE_KEY');
+    }
+
+    if (CONFIG.TRADE_SIZE_USDC > CONFIG.MAX_TRADE_SIZE_USDC) {
+        errors.push(`TRADE_SIZE_USDC ($${CONFIG.TRADE_SIZE_USDC}) > MAX_TRADE_SIZE_USDC ($${CONFIG.MAX_TRADE_SIZE_USDC})`);
     }
 
     if (warnings.length > 0) {
-        console.log('⚠️  Avertissements:');
-        warnings.forEach(w => console.log(`   - ${w}`));
+        console.log('Warnings:');
+        warnings.forEach(w => console.log(`  - ${w}`));
         console.log();
     }
 
     if (errors.length > 0) {
-        console.error('❌ Erreurs de configuration:');
-        errors.forEach(e => console.error(`   - ${e}`));
+        console.error('Config errors:');
+        errors.forEach(e => console.error(`  - ${e}`));
         process.exit(1);
     }
 }
 
 main().catch(e => {
-    console.error('❌ Fatal error:', e);
+    console.error('Fatal:', e);
     process.exit(1);
 });

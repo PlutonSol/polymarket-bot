@@ -1,38 +1,30 @@
 const { ethers } = require('ethers');
 const CONFIG = require('./config');
 
-// ABIs minimaux pour interagir avec les DEX UniswapV2-like
 const UNISWAP_V2_ROUTER_ABI = [
     'function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)',
-    'function getAmountsIn(uint amountOut, address[] calldata path) external view returns (uint[] memory amounts)',
     'function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)',
-    'function swapTokensForExactTokens(uint amountOut, uint amountInMax, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)',
-    'function WETH() external view returns (address)',
 ];
 
 const UNISWAP_V2_FACTORY_ABI = [
     'function getPair(address tokenA, address tokenB) external view returns (address pair)',
-    'function allPairs(uint) external view returns (address pair)',
-    'function allPairsLength() external view returns (uint)',
 ];
 
 const UNISWAP_V2_PAIR_ABI = [
     'function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
     'function token0() external view returns (address)',
-    'function token1() external view returns (address)',
-    'function totalSupply() external view returns (uint)',
 ];
 
 const ERC20_ABI = [
     'function balanceOf(address owner) view returns (uint256)',
     'function decimals() view returns (uint8)',
-    'function symbol() view returns (string)',
     'function approve(address spender, uint256 amount) returns (bool)',
     'function allowance(address owner, address spender) view returns (uint256)',
 ];
 
 /**
- * Client pour interagir avec les DEX sur HyperEVM
+ * Client HyperEVM optimisé pour HYPE uniquement.
+ * Tous les contrats et constantes sont résolus une fois au warmup.
  */
 class HyperEvmClient {
     constructor() {
@@ -49,29 +41,69 @@ class HyperEvmClient {
             ? new ethers.Contract(CONFIG.DEX_FACTORY_ADDRESS, UNISWAP_V2_FACTORY_ABI, this.provider)
             : null;
 
-        // Cache des paires, decimals, token0
-        this.pairCache = new Map();
-        this.decimalsCache = new Map();
-        this.token0Cache = new Map();
-        // Cache du gas price (refresh toutes les 10s)
+        // Objets pré-résolus pour HYPE (chargés au warmup)
+        this.hypePairContract = null;
+        this.hypeIsToken0 = null;
+        this.hypeDecimals = 18; // WHYPE = 18
+        this.usdcDecimals = null;
+
+        // Paths pré-construits
+        this.pathBuyHype = [CONFIG.USDC_ADDRESS, CONFIG.WHYPE_ADDRESS];
+        this.pathSellHype = [CONFIG.WHYPE_ADDRESS, CONFIG.USDC_ADDRESS];
+
+        // Cache gas (refresh 10s)
         this.cachedGasPrice = null;
         this.gasPriceCacheTime = 0;
+
+        // Nonce management pour TX parallèles
+        this.pendingNonce = null;
     }
 
     /**
-     * Pré-approuve tous les tokens configurés pour le router au démarrage.
-     * Élimine le délai d'approval pendant l'exécution d'arbitrage.
+     * Warmup: résout tout une seule fois.
+     * Après ça, getHypePrice() n'a besoin que de getReserves() (1 appel RPC).
+     */
+    async warmup() {
+        console.log('[EVM] Warming up...');
+
+        // Résoudre les decimals USDC
+        const usdcContract = new ethers.Contract(CONFIG.USDC_ADDRESS, ERC20_ABI, this.provider);
+        this.usdcDecimals = Number(await usdcContract.decimals());
+
+        // Résoudre la paire HYPE/USDC
+        if (this.factory) {
+            const pairAddr = await this.factory.getPair(CONFIG.WHYPE_ADDRESS, CONFIG.USDC_ADDRESS);
+            if (pairAddr && pairAddr !== ethers.ZeroAddress) {
+                this.hypePairContract = new ethers.Contract(pairAddr, UNISWAP_V2_PAIR_ABI, this.provider);
+                const token0 = await this.hypePairContract.token0();
+                this.hypeIsToken0 = token0.toLowerCase() === CONFIG.WHYPE_ADDRESS.toLowerCase();
+                console.log(`[EVM] HYPE pair: ${pairAddr} (HYPE is token${this.hypeIsToken0 ? '0' : '1'})`);
+            } else {
+                console.warn('[EVM] HYPE/USDC pair not found on DEX');
+            }
+        }
+
+        // Charger le gas price
+        await this.getGasPrice();
+
+        // Initialiser le nonce
+        if (this.wallet) {
+            this.pendingNonce = await this.provider.getTransactionCount(this.wallet.address, 'pending');
+        }
+
+        console.log(`[EVM] Warmup done (USDC decimals: ${this.usdcDecimals})`);
+    }
+
+    /**
+     * Pré-approuve WHYPE et USDC pour le router.
      */
     async preApproveTokens() {
         if (!this.wallet || !this.router || CONFIG.DRY_RUN) return;
 
-        console.log('[EVM] Pre-approving tokens for router...');
-        const tokensToApprove = [
-            CONFIG.USDC_ADDRESS,
-            ...CONFIG.TOKENS.map(t => t.evmAddress),
-        ];
+        console.log('[EVM] Pre-approving tokens...');
+        const tokens = [CONFIG.USDC_ADDRESS, CONFIG.WHYPE_ADDRESS];
 
-        const results = await Promise.allSettled(tokensToApprove.map(async (addr) => {
+        await Promise.allSettled(tokens.map(async (addr) => {
             const token = new ethers.Contract(addr, ERC20_ABI, this.wallet);
             const allowance = await token.allowance(this.wallet.address, CONFIG.DEX_ROUTER_ADDRESS);
             if (allowance < ethers.MaxUint256 / 2n) {
@@ -82,184 +114,79 @@ class HyperEvmClient {
                 console.log(`[EVM] Already approved ${addr}`);
             }
         }));
-
-        for (const r of results) {
-            if (r.status === 'rejected') {
-                console.error('[EVM] Pre-approve error:', r.reason.message);
-            }
-        }
     }
 
     /**
-     * Pré-charge les decimals et token0 pour tous les tokens configurés.
-     * Élimine les appels RPC pendant le scan.
+     * Prix HYPE depuis les reserves de la paire.
+     * Ultra-rapide: 1 seul appel RPC (getReserves), tout le reste est en cache.
      */
-    async warmupCaches() {
-        console.log('[EVM] Warming up caches...');
-        const allAddresses = [
-            CONFIG.USDC_ADDRESS,
-            ...CONFIG.TOKENS.map(t => t.evmAddress),
-        ];
+    async getHypePrice() {
+        if (!this.hypePairContract) return null;
 
-        // Charger tous les decimals en parallèle
-        await Promise.allSettled(allAddresses.map(async (addr) => {
-            const contract = new ethers.Contract(addr, ERC20_ABI, this.provider);
-            const decimals = await contract.decimals();
-            this.decimalsCache.set(addr.toLowerCase(), Number(decimals));
-        }));
+        const reserves = await this.hypePairContract.getReserves();
 
-        // Charger les paires et token0 en parallèle
-        await Promise.allSettled(CONFIG.TOKENS.map(async (token) => {
-            const pairAddr = await this._getPairAddress(token.evmAddress, CONFIG.USDC_ADDRESS);
-            if (pairAddr && pairAddr !== ethers.ZeroAddress) {
-                const pair = new ethers.Contract(pairAddr, UNISWAP_V2_PAIR_ABI, this.provider);
-                const token0 = await pair.token0();
-                this.token0Cache.set(pairAddr.toLowerCase(), token0);
-            }
-        }));
+        const hypeReserve = this.hypeIsToken0 ? reserves[0] : reserves[1];
+        const usdcReserve = this.hypeIsToken0 ? reserves[1] : reserves[0];
 
-        // Charger le gas price
-        await this.getGasPrice();
+        const hypeFloat = parseFloat(ethers.formatUnits(hypeReserve, this.hypeDecimals));
+        const usdcFloat = parseFloat(ethers.formatUnits(usdcReserve, this.usdcDecimals));
 
-        console.log(`[EVM] Cached ${this.decimalsCache.size} decimals, ${this.pairCache.size} pairs`);
-    }
-
-    /**
-     * Récupère les decimals d'un token (depuis le cache si possible)
-     */
-    async _getDecimals(addr) {
-        const key = addr.toLowerCase();
-        if (this.decimalsCache.has(key)) return this.decimalsCache.get(key);
-        const contract = new ethers.Contract(addr, ERC20_ABI, this.provider);
-        const decimals = Number(await contract.decimals());
-        this.decimalsCache.set(key, decimals);
-        return decimals;
-    }
-
-    /**
-     * Récupère le prix d'un token sur le DEX EVM via les réserves de la paire.
-     * Optimisé: utilise le cache pour decimals et token0.
-     */
-    async getTokenPriceFromPair(tokenAddress) {
-        const pairAddr = await this._getPairAddress(tokenAddress, CONFIG.USDC_ADDRESS);
-        if (!pairAddr || pairAddr === ethers.ZeroAddress) return null;
-
-        const pair = new ethers.Contract(pairAddr, UNISWAP_V2_PAIR_ABI, this.provider);
-
-        // token0 depuis le cache, reserves toujours fraîches
-        let token0 = this.token0Cache.get(pairAddr.toLowerCase());
-        let reserves;
-        if (token0) {
-            reserves = await pair.getReserves();
-        } else {
-            [reserves, token0] = await Promise.all([
-                pair.getReserves(),
-                pair.token0(),
-            ]);
-            this.token0Cache.set(pairAddr.toLowerCase(), token0);
-        }
-
-        const isToken0 = token0.toLowerCase() === tokenAddress.toLowerCase();
-
-        // Decimals depuis le cache
-        const [tokenDecimals, usdcDecimals] = await Promise.all([
-            this._getDecimals(tokenAddress),
-            this._getDecimals(CONFIG.USDC_ADDRESS),
-        ]);
-
-        const tokenReserve = isToken0 ? reserves[0] : reserves[1];
-        const usdcReserve = isToken0 ? reserves[1] : reserves[0];
-
-        const tokenReserveFloat = parseFloat(ethers.formatUnits(tokenReserve, tokenDecimals));
-        const usdcReserveFloat = parseFloat(ethers.formatUnits(usdcReserve, usdcDecimals));
-
-        if (tokenReserveFloat === 0) return null;
-
-        const price = usdcReserveFloat / tokenReserveFloat;
+        if (hypeFloat === 0) return null;
 
         return {
-            price,
-            tokenReserve: tokenReserveFloat,
-            usdcReserve: usdcReserveFloat,
-            liquidity: usdcReserveFloat * 2,
-            pairAddress: pairAddr,
+            price: usdcFloat / hypeFloat,
+            hypeReserve: hypeFloat,
+            usdcReserve: usdcFloat,
+            liquidity: usdcFloat * 2,
         };
     }
 
     /**
-     * Simule un swap pour obtenir le prix effectif avec slippage
+     * Prix effectif HYPE pour un montant donné (inclut slippage AMM).
+     * Passe les réserves déjà récupérées pour éviter un double appel.
      */
-    async getAmountsOut(amountIn, path) {
-        if (!this.router) throw new Error('Router address not configured');
-        try {
-            const amounts = await this.router.getAmountsOut(amountIn, path);
-            return amounts.map(a => a);
-        } catch (e) {
-            console.error('getAmountsOut error:', e.message);
-            return null;
-        }
-    }
-
-    /**
-     * Calcule le prix effectif pour un montant donné (inclut le slippage AMM).
-     * Optimisé: utilise le cache de decimals.
-     */
-    async getEffectivePrice(tokenAddress, amountUSDC, direction = 'buy') {
+    async getEffectivePrice(amountUSDC, direction, existingReserves) {
         if (!this.router) return null;
 
-        const [usdcDecimals, tokenDecimals] = await Promise.all([
-            this._getDecimals(CONFIG.USDC_ADDRESS),
-            this._getDecimals(tokenAddress),
-        ]);
-
         if (direction === 'buy') {
-            const amountIn = ethers.parseUnits(amountUSDC.toString(), usdcDecimals);
-            const path = [CONFIG.USDC_ADDRESS, tokenAddress];
-            const amounts = await this.getAmountsOut(amountIn, path);
-            if (!amounts) return null;
+            const amountIn = ethers.parseUnits(amountUSDC.toString(), this.usdcDecimals);
+            const amounts = await this.router.getAmountsOut(amountIn, this.pathBuyHype);
+            const hypeOut = parseFloat(ethers.formatUnits(amounts[1], this.hypeDecimals));
+            const effectivePrice = amountUSDC / hypeOut;
 
-            const tokenOut = parseFloat(ethers.formatUnits(amounts[1], tokenDecimals));
-            const effectivePrice = amountUSDC / tokenOut;
+            // Price impact calculé depuis les réserves
+            const spotPrice = existingReserves
+                ? existingReserves.usdcReserve / existingReserves.hypeReserve
+                : effectivePrice;
+            const priceImpact = ((effectivePrice - spotPrice) / spotPrice) * 100;
 
-            return {
-                amountIn: amountUSDC,
-                amountOut: tokenOut,
-                effectivePrice,
-                priceImpact: 0,
-            };
+            return { amountOut: hypeOut, effectivePrice, priceImpact: Math.abs(priceImpact) };
         } else {
-            const spotData = await this.getTokenPriceFromPair(tokenAddress);
-            if (!spotData) return null;
+            const spotPrice = existingReserves
+                ? existingReserves.usdcReserve / existingReserves.hypeReserve
+                : null;
+            if (!spotPrice) return null;
 
-            const tokenAmount = amountUSDC / spotData.price;
-            const amountIn = ethers.parseUnits(tokenAmount.toFixed(8), tokenDecimals);
-            const path = [tokenAddress, CONFIG.USDC_ADDRESS];
-            const amounts = await this.getAmountsOut(amountIn, path);
-            if (!amounts) return null;
+            const hypeAmount = amountUSDC / spotPrice;
+            const amountIn = ethers.parseUnits(hypeAmount.toFixed(8), this.hypeDecimals);
+            const amounts = await this.router.getAmountsOut(amountIn, this.pathSellHype);
+            const usdcOut = parseFloat(ethers.formatUnits(amounts[1], this.usdcDecimals));
+            const effectivePrice = usdcOut / hypeAmount;
+            const priceImpact = ((spotPrice - effectivePrice) / spotPrice) * 100;
 
-            const usdcOut = parseFloat(ethers.formatUnits(amounts[1], usdcDecimals));
-            const effectivePrice = usdcOut / tokenAmount;
-
-            return {
-                amountIn: tokenAmount,
-                amountOut: usdcOut,
-                effectivePrice,
-                priceImpact: ((spotData.price - effectivePrice) / spotData.price) * 100,
-            };
+            return { amountOut: usdcOut, effectivePrice, priceImpact: Math.abs(priceImpact) };
         }
     }
 
     /**
-     * Exécute un swap sur le DEX.
-     * Optimisé: plus de check d'allowance (pré-approuvé au démarrage).
+     * Exécute un swap avec gestion du nonce pour les TX parallèles.
      */
-    async executeSwap(tokenAddress, amountIn, minAmountOut, path) {
+    async executeSwap(amountIn, minAmountOut, path) {
         if (!this.wallet) throw new Error('Wallet not configured');
         if (!this.router) throw new Error('Router not configured');
 
         if (CONFIG.DRY_RUN) {
             console.log('[DRY-RUN] EVM swap:', {
-                tokenAddress,
                 amountIn: amountIn.toString(),
                 minAmountOut: minAmountOut.toString(),
                 path,
@@ -267,20 +194,24 @@ class HyperEvmClient {
             return { status: 'dry-run', amountIn, minAmountOut };
         }
 
-        // Deadline: 30 secondes (serré pour l'arb)
         const deadline = Math.floor(Date.now() / 1000) + 30;
+
+        // Nonce géré manuellement pour les TX parallèles
+        const nonce = this.pendingNonce;
+        this.pendingNonce++;
 
         const tx = await this.router.swapExactTokensForTokens(
             amountIn,
             minAmountOut,
             path,
             this.wallet.address,
-            deadline
+            deadline,
+            { nonce }
         );
 
         console.log('Swap TX sent:', tx.hash);
         const receipt = await tx.wait();
-        console.log('Swap confirmed in block:', receipt.blockNumber);
+        console.log('Swap confirmed block:', receipt.blockNumber);
 
         return {
             status: 'confirmed',
@@ -291,41 +222,29 @@ class HyperEvmClient {
     }
 
     /**
-     * Récupère les balances EVM du wallet
+     * Récupère les balances HYPE + USDC du wallet
      */
-    async getBalances(tokenAddresses) {
-        if (!this.wallet) return {};
+    async getBalances() {
+        if (!this.wallet) return null;
 
-        const balances = {};
-        const promises = tokenAddresses.map(async (addr) => {
-            const contract = new ethers.Contract(addr, ERC20_ABI, this.provider);
-            const [balance, decimals, symbol] = await Promise.all([
-                contract.balanceOf(this.wallet.address),
-                this._getDecimals(addr),
-                contract.symbol(),
-            ]);
-            balances[symbol] = {
-                raw: balance,
-                formatted: parseFloat(ethers.formatUnits(balance, decimals)),
-                decimals,
-                address: addr,
-            };
-        });
+        const hypeContract = new ethers.Contract(CONFIG.WHYPE_ADDRESS, ERC20_ABI, this.provider);
+        const usdcContract = new ethers.Contract(CONFIG.USDC_ADDRESS, ERC20_ABI, this.provider);
 
-        await Promise.all(promises);
+        const [hypeBalance, usdcBalance, nativeBalance] = await Promise.all([
+            hypeContract.balanceOf(this.wallet.address),
+            usdcContract.balanceOf(this.wallet.address),
+            this.provider.getBalance(this.wallet.address),
+        ]);
 
-        const nativeBalance = await this.provider.getBalance(this.wallet.address);
-        balances['HYPE_NATIVE'] = {
-            raw: nativeBalance,
-            formatted: parseFloat(ethers.formatEther(nativeBalance)),
-            decimals: 18,
+        return {
+            hype: parseFloat(ethers.formatUnits(hypeBalance, this.hypeDecimals)),
+            usdc: parseFloat(ethers.formatUnits(usdcBalance, this.usdcDecimals || 6)),
+            nativeHype: parseFloat(ethers.formatEther(nativeBalance)),
         };
-
-        return balances;
     }
 
     /**
-     * Récupère le gas price actuel (cache de 10s)
+     * Gas price avec cache 10s
      */
     async getGasPrice() {
         const now = Date.now();
@@ -341,25 +260,13 @@ class HyperEvmClient {
         return this.cachedGasPrice;
     }
 
-    async _getPairContract(tokenA, tokenB) {
-        const pairAddr = await this._getPairAddress(tokenA, tokenB);
-        if (!pairAddr || pairAddr === ethers.ZeroAddress) return null;
-        return new ethers.Contract(pairAddr, UNISWAP_V2_PAIR_ABI, this.provider);
-    }
-
-    async _getPairAddress(tokenA, tokenB) {
-        const key = `${tokenA}-${tokenB}`.toLowerCase();
-        if (this.pairCache.has(key)) return this.pairCache.get(key);
-
-        if (!this.factory) return null;
-
-        try {
-            const pairAddr = await this.factory.getPair(tokenA, tokenB);
-            this.pairCache.set(key, pairAddr);
-            return pairAddr;
-        } catch (e) {
-            console.error('getPair error:', e.message);
-            return null;
+    /**
+     * Resync le nonce depuis la chain (après erreur)
+     */
+    async resyncNonce() {
+        if (this.wallet) {
+            this.pendingNonce = await this.provider.getTransactionCount(this.wallet.address, 'pending');
+            console.log('[EVM] Nonce resynced:', this.pendingNonce);
         }
     }
 }
