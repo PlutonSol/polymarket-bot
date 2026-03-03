@@ -49,47 +49,127 @@ class HyperEvmClient {
             ? new ethers.Contract(CONFIG.DEX_FACTORY_ADDRESS, UNISWAP_V2_FACTORY_ABI, this.provider)
             : null;
 
-        // Cache des paires
+        // Cache des paires, decimals, token0
         this.pairCache = new Map();
+        this.decimalsCache = new Map();
+        this.token0Cache = new Map();
+        // Cache du gas price (refresh toutes les 10s)
+        this.cachedGasPrice = null;
+        this.gasPriceCacheTime = 0;
     }
 
     /**
-     * Récupère le prix d'un token sur le DEX EVM via les réserves de la paire
-     * Retourne le prix en USDC
+     * Pré-approuve tous les tokens configurés pour le router au démarrage.
+     * Élimine le délai d'approval pendant l'exécution d'arbitrage.
+     */
+    async preApproveTokens() {
+        if (!this.wallet || !this.router || CONFIG.DRY_RUN) return;
+
+        console.log('[EVM] Pre-approving tokens for router...');
+        const tokensToApprove = [
+            CONFIG.USDC_ADDRESS,
+            ...CONFIG.TOKENS.map(t => t.evmAddress),
+        ];
+
+        const results = await Promise.allSettled(tokensToApprove.map(async (addr) => {
+            const token = new ethers.Contract(addr, ERC20_ABI, this.wallet);
+            const allowance = await token.allowance(this.wallet.address, CONFIG.DEX_ROUTER_ADDRESS);
+            if (allowance < ethers.MaxUint256 / 2n) {
+                const tx = await token.approve(CONFIG.DEX_ROUTER_ADDRESS, ethers.MaxUint256);
+                await tx.wait();
+                console.log(`[EVM] Approved ${addr}`);
+            } else {
+                console.log(`[EVM] Already approved ${addr}`);
+            }
+        }));
+
+        for (const r of results) {
+            if (r.status === 'rejected') {
+                console.error('[EVM] Pre-approve error:', r.reason.message);
+            }
+        }
+    }
+
+    /**
+     * Pré-charge les decimals et token0 pour tous les tokens configurés.
+     * Élimine les appels RPC pendant le scan.
+     */
+    async warmupCaches() {
+        console.log('[EVM] Warming up caches...');
+        const allAddresses = [
+            CONFIG.USDC_ADDRESS,
+            ...CONFIG.TOKENS.map(t => t.evmAddress),
+        ];
+
+        // Charger tous les decimals en parallèle
+        await Promise.allSettled(allAddresses.map(async (addr) => {
+            const contract = new ethers.Contract(addr, ERC20_ABI, this.provider);
+            const decimals = await contract.decimals();
+            this.decimalsCache.set(addr.toLowerCase(), Number(decimals));
+        }));
+
+        // Charger les paires et token0 en parallèle
+        await Promise.allSettled(CONFIG.TOKENS.map(async (token) => {
+            const pairAddr = await this._getPairAddress(token.evmAddress, CONFIG.USDC_ADDRESS);
+            if (pairAddr && pairAddr !== ethers.ZeroAddress) {
+                const pair = new ethers.Contract(pairAddr, UNISWAP_V2_PAIR_ABI, this.provider);
+                const token0 = await pair.token0();
+                this.token0Cache.set(pairAddr.toLowerCase(), token0);
+            }
+        }));
+
+        // Charger le gas price
+        await this.getGasPrice();
+
+        console.log(`[EVM] Cached ${this.decimalsCache.size} decimals, ${this.pairCache.size} pairs`);
+    }
+
+    /**
+     * Récupère les decimals d'un token (depuis le cache si possible)
+     */
+    async _getDecimals(addr) {
+        const key = addr.toLowerCase();
+        if (this.decimalsCache.has(key)) return this.decimalsCache.get(key);
+        const contract = new ethers.Contract(addr, ERC20_ABI, this.provider);
+        const decimals = Number(await contract.decimals());
+        this.decimalsCache.set(key, decimals);
+        return decimals;
+    }
+
+    /**
+     * Récupère le prix d'un token sur le DEX EVM via les réserves de la paire.
+     * Optimisé: utilise le cache pour decimals et token0.
      */
     async getTokenPriceFromPair(tokenAddress) {
-        const pair = await this._getPairContract(tokenAddress, CONFIG.USDC_ADDRESS);
-        if (!pair) return null;
+        const pairAddr = await this._getPairAddress(tokenAddress, CONFIG.USDC_ADDRESS);
+        if (!pairAddr || pairAddr === ethers.ZeroAddress) return null;
 
-        const [reserves, token0] = await Promise.all([
-            pair.getReserves(),
-            pair.token0(),
-        ]);
+        const pair = new ethers.Contract(pairAddr, UNISWAP_V2_PAIR_ABI, this.provider);
 
-        const reserve0 = reserves[0];
-        const reserve1 = reserves[1];
-
-        // Déterminer quel token est token0 et token1
-        const isToken0 = token0.toLowerCase() === tokenAddress.toLowerCase();
-
-        // Token decimals
-        const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, this.provider);
-        const usdcContract = new ethers.Contract(CONFIG.USDC_ADDRESS, ERC20_ABI, this.provider);
-        const [tokenDecimals, usdcDecimals] = await Promise.all([
-            tokenContract.decimals(),
-            usdcContract.decimals(),
-        ]);
-
-        let tokenReserve, usdcReserve;
-        if (isToken0) {
-            tokenReserve = reserve0;
-            usdcReserve = reserve1;
+        // token0 depuis le cache, reserves toujours fraîches
+        let token0 = this.token0Cache.get(pairAddr.toLowerCase());
+        let reserves;
+        if (token0) {
+            reserves = await pair.getReserves();
         } else {
-            tokenReserve = reserve1;
-            usdcReserve = reserve0;
+            [reserves, token0] = await Promise.all([
+                pair.getReserves(),
+                pair.token0(),
+            ]);
+            this.token0Cache.set(pairAddr.toLowerCase(), token0);
         }
 
-        // Prix = usdcReserve / tokenReserve (ajusté pour les decimals)
+        const isToken0 = token0.toLowerCase() === tokenAddress.toLowerCase();
+
+        // Decimals depuis le cache
+        const [tokenDecimals, usdcDecimals] = await Promise.all([
+            this._getDecimals(tokenAddress),
+            this._getDecimals(CONFIG.USDC_ADDRESS),
+        ]);
+
+        const tokenReserve = isToken0 ? reserves[0] : reserves[1];
+        const usdcReserve = isToken0 ? reserves[1] : reserves[0];
+
         const tokenReserveFloat = parseFloat(ethers.formatUnits(tokenReserve, tokenDecimals));
         const usdcReserveFloat = parseFloat(ethers.formatUnits(usdcReserve, usdcDecimals));
 
@@ -102,13 +182,12 @@ class HyperEvmClient {
             tokenReserve: tokenReserveFloat,
             usdcReserve: usdcReserveFloat,
             liquidity: usdcReserveFloat * 2,
-            pairAddress: await this._getPairAddress(tokenAddress, CONFIG.USDC_ADDRESS),
+            pairAddress: pairAddr,
         };
     }
 
     /**
      * Simule un swap pour obtenir le prix effectif avec slippage
-     * amountIn en USDC pour acheter le token, ou en token pour vendre
      */
     async getAmountsOut(amountIn, path) {
         if (!this.router) throw new Error('Router address not configured');
@@ -122,21 +201,18 @@ class HyperEvmClient {
     }
 
     /**
-     * Calcule le prix effectif pour un montant donné (inclut le slippage AMM)
-     * direction: 'buy' = USDC -> Token, 'sell' = Token -> USDC
+     * Calcule le prix effectif pour un montant donné (inclut le slippage AMM).
+     * Optimisé: utilise le cache de decimals.
      */
     async getEffectivePrice(tokenAddress, amountUSDC, direction = 'buy') {
         if (!this.router) return null;
 
-        const usdcContract = new ethers.Contract(CONFIG.USDC_ADDRESS, ERC20_ABI, this.provider);
-        const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, this.provider);
         const [usdcDecimals, tokenDecimals] = await Promise.all([
-            usdcContract.decimals(),
-            tokenContract.decimals(),
+            this._getDecimals(CONFIG.USDC_ADDRESS),
+            this._getDecimals(tokenAddress),
         ]);
 
         if (direction === 'buy') {
-            // USDC -> Token : combien de tokens pour X USDC
             const amountIn = ethers.parseUnits(amountUSDC.toString(), usdcDecimals);
             const path = [CONFIG.USDC_ADDRESS, tokenAddress];
             const amounts = await this.getAmountsOut(amountIn, path);
@@ -149,11 +225,9 @@ class HyperEvmClient {
                 amountIn: amountUSDC,
                 amountOut: tokenOut,
                 effectivePrice,
-                priceImpact: 0, // Calculé séparément
+                priceImpact: 0,
             };
         } else {
-            // Token -> USDC : combien de USDC pour X tokens
-            // D'abord calculer combien de tokens correspondent à amountUSDC au prix spot
             const spotData = await this.getTokenPriceFromPair(tokenAddress);
             if (!spotData) return null;
 
@@ -176,7 +250,8 @@ class HyperEvmClient {
     }
 
     /**
-     * Exécute un swap sur le DEX
+     * Exécute un swap sur le DEX.
+     * Optimisé: plus de check d'allowance (pré-approuvé au démarrage).
      */
     async executeSwap(tokenAddress, amountIn, minAmountOut, path) {
         if (!this.wallet) throw new Error('Wallet not configured');
@@ -192,22 +267,8 @@ class HyperEvmClient {
             return { status: 'dry-run', amountIn, minAmountOut };
         }
 
-        // Vérifier et approuver si nécessaire
-        const tokenIn = new ethers.Contract(path[0], ERC20_ABI, this.wallet);
-        const allowance = await tokenIn.allowance(this.wallet.address, CONFIG.DEX_ROUTER_ADDRESS);
-
-        if (allowance < amountIn) {
-            console.log('Approving token spend...');
-            const approveTx = await tokenIn.approve(
-                CONFIG.DEX_ROUTER_ADDRESS,
-                ethers.MaxUint256
-            );
-            await approveTx.wait();
-            console.log('Approval confirmed');
-        }
-
-        // Deadline: 2 minutes
-        const deadline = Math.floor(Date.now() / 1000) + 120;
+        // Deadline: 30 secondes (serré pour l'arb)
+        const deadline = Math.floor(Date.now() / 1000) + 30;
 
         const tx = await this.router.swapExactTokensForTokens(
             amountIn,
@@ -240,7 +301,7 @@ class HyperEvmClient {
             const contract = new ethers.Contract(addr, ERC20_ABI, this.provider);
             const [balance, decimals, symbol] = await Promise.all([
                 contract.balanceOf(this.wallet.address),
-                contract.decimals(),
+                this._getDecimals(addr),
                 contract.symbol(),
             ]);
             balances[symbol] = {
@@ -253,7 +314,6 @@ class HyperEvmClient {
 
         await Promise.all(promises);
 
-        // Balance native (HYPE)
         const nativeBalance = await this.provider.getBalance(this.wallet.address);
         balances['HYPE_NATIVE'] = {
             raw: nativeBalance,
@@ -265,19 +325,22 @@ class HyperEvmClient {
     }
 
     /**
-     * Récupère le gas price actuel
+     * Récupère le gas price actuel (cache de 10s)
      */
     async getGasPrice() {
+        const now = Date.now();
+        if (this.cachedGasPrice && (now - this.gasPriceCacheTime) < 10000) {
+            return this.cachedGasPrice;
+        }
         const feeData = await this.provider.getFeeData();
-        return {
+        this.cachedGasPrice = {
             gasPrice: feeData.gasPrice,
             gasPriceGwei: parseFloat(ethers.formatUnits(feeData.gasPrice || 0n, 'gwei')),
         };
+        this.gasPriceCacheTime = now;
+        return this.cachedGasPrice;
     }
 
-    /**
-     * Récupère le contrat de paire pour deux tokens
-     */
     async _getPairContract(tokenA, tokenB) {
         const pairAddr = await this._getPairAddress(tokenA, tokenB);
         if (!pairAddr || pairAddr === ethers.ZeroAddress) return null;

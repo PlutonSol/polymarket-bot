@@ -81,7 +81,13 @@ class TelegramNotifier {
 📉 Profit moyen: $${stats.avgProfitPerTrade.toFixed(4)}
 🎯 Taux opportunités: ${stats.successRate}
 ⚠️ Erreurs: ${stats.errors}
-🤖 Mode: ${CONFIG.DRY_RUN ? 'Dry Run' : 'LIVE'}`);
+🤖 Mode: ${CONFIG.DRY_RUN ? 'Dry Run' : 'LIVE'}
+
+⚡ *Vitesse:*
+• Scan moyen: ${stats.avgScanMs.toFixed(0)}ms
+• Dernier scan: ${stats.lastScanMs}ms
+• Exec moyenne: ${stats.avgExecMs.toFixed(0)}ms
+• Dernière exec: ${stats.lastExecMs}ms`);
         });
 
         // /opps - Dernières opportunités
@@ -265,6 +271,7 @@ ${opp.profitable ? '✅ Profitable' : '❌ Non profitable'}`;
 💰 Profit estimé: $${opp.netProfit.toFixed(4)}
 📊 ${opp.buyVenue} → ${opp.sellVenue}
 
+⚡ Temps d'exécution: ${results.execMs || 'N/A'}ms
 EVM TX: ${results.evmResult?.txHash || 'N/A'}
 HL Order: ${results.hlResult?.status || 'N/A'}`;
 
