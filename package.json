@@ -1,12 +1,16 @@
 {
-  "name": "polymarket-notify-bot",
-  "version": "5.0.0",
-  "main": "bot.js",
+  "name": "hyperliquid-arbitrage-bot",
+  "version": "1.0.0",
+  "description": "Arbitrage bot between Hyperliquid native spot and HyperEVM DEXes",
+  "main": "src/index.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node src/index.js",
+    "start:old": "node bot.js"
   },
   "dependencies": {
     "dotenv": "^16.3.1",
-    "node-telegram-bot-api": "^0.64.0"
+    "ethers": "^6.13.0",
+    "node-telegram-bot-api": "^0.64.0",
+    "ws": "^8.16.0"
   }
 }
