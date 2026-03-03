@@ -1,7 +1,6 @@
 const { ethers } = require('ethers');
 const CONFIG = require('./config');
 
-// EIP-712 domain pour Hyperliquid
 const HL_DOMAIN = {
     name: 'Exchange',
     version: '1',
@@ -17,27 +16,25 @@ const AGENT_TYPES = {
 };
 
 /**
- * Client pour l'API native Hyperliquid (L1 spot/perp)
+ * Client Hyperliquid optimisé.
+ * - Wallet créé une seule fois
+ * - Index HYPE pré-résolu
+ * - HTTP keep-alive implicite (Node.js fetch)
+ * - Timeout court sur toutes les requêtes
  */
 class HyperliquidClient {
     constructor() {
         this.baseUrl = CONFIG.HYPERLIQUID_API;
         this.cachedMeta = null;
-        // Pré-résoudre l'index du token HYPE pour éviter des lookups
         this.hypeIndex = null;
-        // Wallet réutilisable (créé une seule fois)
         this.wallet = CONFIG.PRIVATE_KEY
             ? new ethers.Wallet(CONFIG.PRIVATE_KEY)
             : null;
     }
 
-    /**
-     * Requête POST avec timeout
-     */
     async postInfo(body) {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), CONFIG.FETCH_TIMEOUT_MS);
-
         try {
             const res = await fetch(`${this.baseUrl}/info`, {
                 method: 'POST',
@@ -45,39 +42,29 @@ class HyperliquidClient {
                 body: JSON.stringify(body),
                 signal: controller.signal,
             });
-            if (!res.ok) {
-                throw new Error(`Hyperliquid API error: ${res.status} ${res.statusText}`);
-            }
+            if (!res.ok) throw new Error(`HL API ${res.status}`);
             return res.json();
         } finally {
             clearTimeout(timeout);
         }
     }
 
-    /**
-     * Récupère les métadonnées spot et pré-résout l'index HYPE
-     */
     async getSpotMeta() {
         if (this.cachedMeta) return this.cachedMeta;
         const data = await this.postInfo({ type: 'spotMeta' });
         this.cachedMeta = data;
-
-        // Pré-résoudre l'index HYPE
         if (data && data.tokens) {
             const hype = data.tokens.find(t => t.name === 'HYPE');
             if (hype) this.hypeIndex = hype.index;
         }
-
         return data;
     }
 
     /**
-     * Récupère le best bid/ask pour HYPE (optimisé: un seul appel, pas de lookup)
+     * Best bid/ask HYPE. Un seul HTTP POST (~50-80ms).
      */
     async getHypeBestBidAsk() {
-        if (this.hypeIndex === null) {
-            await this.getSpotMeta();
-        }
+        if (this.hypeIndex === null) await this.getSpotMeta();
         if (this.hypeIndex === null) return null;
 
         const data = await this.postInfo({
@@ -86,28 +73,23 @@ class HyperliquidClient {
         });
 
         if (!data || !data.levels) return null;
-
         const [bids, asks] = data.levels;
-        const bestBid = bids && bids.length > 0 ? parseFloat(bids[0].px) : null;
-        const bestAsk = asks && asks.length > 0 ? parseFloat(asks[0].px) : null;
-        const bidSize = bids && bids.length > 0 ? parseFloat(bids[0].sz) : 0;
-        const askSize = asks && asks.length > 0 ? parseFloat(asks[0].sz) : 0;
-
-        return { bestBid, bestAsk, bidSize, askSize };
+        return {
+            bestBid: bids && bids.length > 0 ? parseFloat(bids[0].px) : null,
+            bestAsk: asks && asks.length > 0 ? parseFloat(asks[0].px) : null,
+            bidSize: bids && bids.length > 0 ? parseFloat(bids[0].sz) : 0,
+            askSize: asks && asks.length > 0 ? parseFloat(asks[0].sz) : 0,
+        };
     }
 
     /**
-     * Place un ordre spot HYPE via l'API exchange
+     * Place un ordre IOC et retourne le résultat.
+     * Sign EIP-712 (~5ms local) + HTTP POST (~80ms).
      */
     async placeSpotOrder(params) {
         const { isBuy, size, price } = params;
-
-        if (this.hypeIndex === null) {
-            await this.getSpotMeta();
-        }
-        if (this.hypeIndex === null) {
-            throw new Error('HYPE token not found in spot meta');
-        }
+        if (this.hypeIndex === null) await this.getSpotMeta();
+        if (this.hypeIndex === null) throw new Error('HYPE not found');
 
         const action = {
             type: 'order',
@@ -125,23 +107,16 @@ class HyperliquidClient {
         return this._signAndSend(action);
     }
 
-    /**
-     * Signe et envoie une action à l'API exchange avec EIP-712
-     */
     async _signAndSend(action) {
         if (CONFIG.DRY_RUN) {
             console.log('[DRY-RUN] HL order:', JSON.stringify(action));
             return { status: 'dry-run', action };
         }
 
-        if (!this.wallet) {
-            throw new Error('PRIVATE_KEY not configured, cannot sign');
-        }
+        if (!this.wallet) throw new Error('PRIVATE_KEY not configured');
 
-        const timestamp = Date.now();
-        const nonce = timestamp;
+        const nonce = Date.now();
 
-        // Signer avec EIP-712 selon le protocole Hyperliquid
         const connectionId = ethers.keccak256(
             ethers.AbiCoder.defaultAbiCoder().encode(
                 ['string', 'uint64'],
@@ -152,18 +127,10 @@ class HyperliquidClient {
         const signature = await this.wallet.signTypedData(
             HL_DOMAIN,
             AGENT_TYPES,
-            {
-                source: 'a',
-                connectionId,
-            }
+            { source: 'a', connectionId }
         );
 
-        const payload = {
-            action,
-            nonce,
-            signature,
-            vaultAddress: null,
-        };
+        const payload = { action, nonce, signature, vaultAddress: null };
 
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), CONFIG.FETCH_TIMEOUT_MS);
@@ -175,28 +142,20 @@ class HyperliquidClient {
                 body: JSON.stringify(payload),
                 signal: controller.signal,
             });
-
             if (!res.ok) {
-                const error = await res.text();
-                throw new Error(`Hyperliquid exchange error: ${res.status} - ${error}`);
+                const err = await res.text();
+                throw new Error(`HL exchange ${res.status}: ${err}`);
             }
-
             return res.json();
         } finally {
             clearTimeout(timeout);
         }
     }
 
-    /**
-     * Récupère les balances spot du wallet
-     */
     async getSpotBalances(walletAddress) {
         const addr = walletAddress || CONFIG.WALLET_ADDRESS;
         if (!addr) return null;
-        return this.postInfo({
-            type: 'spotClearinghouseState',
-            user: addr,
-        });
+        return this.postInfo({ type: 'spotClearinghouseState', user: addr });
     }
 
     clearCache() {

@@ -69,15 +69,17 @@ class TelegramNotifier {
 🔍 Scans: ${stats.scans.toLocaleString()}
 💡 Opportunités: ${stats.opportunities}
 📈 Trades: ${stats.trades} (${stats.tradesLastHour}/h)
-💰 Profit total: $${stats.totalProfit.toFixed(4)}
-📉 Profit moyen: $${stats.avgProfitPerTrade.toFixed(4)}
+✅ Confirmés: ${stats.confirmedTrades} | ❌ Revert: ${stats.revertedTrades}
+⏳ Pending: ${stats.pendingTxs}
+💰 Profit: $${stats.totalProfit.toFixed(4)}
+📉 Moyen: $${stats.avgProfitPerTrade.toFixed(4)}
 🎯 Taux: ${stats.successRate}
 ⚠️ Erreurs: ${stats.errors}
 💔 Pertes: $${stats.totalLoss.toFixed(4)}
-🛑 Circuit breaker: ${stats.circuitBroken ? '🔴 ACTIF' : '🟢 OK'}
+🛑 CB: ${stats.circuitBroken ? '🔴 ACTIF' : '🟢 OK'}
 🤖 Mode: ${CONFIG.DRY_RUN ? 'Dry Run' : 'LIVE'}
 
-⚡ *Vitesse:*
+⚡ *Vitesse (block-aligned):*
 • Scan moyen: ${stats.avgScanMs.toFixed(0)}ms
 • Dernier scan: ${stats.lastScanMs}ms
 • Exec moyenne: ${stats.avgExecMs.toFixed(0)}ms

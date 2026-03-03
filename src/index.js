@@ -22,8 +22,8 @@ Hyperliquid L1 ↔ HyperEVM DEX
 • Taille: $${CONFIG.TRADE_SIZE_USDC}
 • Slippage max: ${CONFIG.MAX_SLIPPAGE_PCT}%
 • Max loss: $${CONFIG.MAX_LOSS_USD}
-• Scan: ${CONFIG.SCAN_INTERVAL_MS}ms
 • Mode: ${CONFIG.DRY_RUN ? '🧪 Dry Run' : '🔴 LIVE'}
+• Trigger: block-aligned (2s blocks)
 
 /start\\_arb pour démarrer`);
 
@@ -40,7 +40,7 @@ Hyperliquid L1 ↔ HyperEVM DEX
 
 • Durée: ${stats.uptimeStr}
 • Scans: ${stats.scans}
-• Trades: ${stats.trades}
+• Trades: ${stats.trades} (${stats.confirmedTrades}ok/${stats.revertedTrades}fail)
 • Profit: $${stats.totalProfit.toFixed(4)}
 • Pertes: $${stats.totalLoss.toFixed(4)}`);
         process.exit(0);
