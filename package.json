@@ -1,12 +1,17 @@
 {
-  "name": "polymarket-notify-bot",
-  "version": "5.0.0",
-  "main": "bot.js",
+  "name": "polymarket-llm-trading-bot",
+  "version": "6.0.0",
+  "description": "Bot de trading LLM pour Polymarket - Génération de volume automatique",
+  "main": "index.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node index.js",
+    "start:old": "node bot.js",
+    "dev": "DRY_RUN=true node index.js"
   },
   "dependencies": {
+    "@polymarket/clob-client": "^4.0.0",
     "dotenv": "^16.3.1",
+    "ethers": "^5.7.2",
     "node-telegram-bot-api": "^0.64.0"
   }
 }
