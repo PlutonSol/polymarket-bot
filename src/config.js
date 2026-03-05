@@ -52,6 +52,12 @@ function validateConfig() {
     }
     if (!CONFIG.TELEGRAM_BOT_TOKEN) errors.push('TELEGRAM_BOT_TOKEN requis');
     if (!CONFIG.TELEGRAM_CHAT_ID) errors.push('TELEGRAM_CHAT_ID requis');
+    if (CONFIG.MAX_WALLET_EXPOSURE > 1 || CONFIG.MAX_WALLET_EXPOSURE <= 0) {
+        errors.push('MAX_WALLET_EXPOSURE doit être entre 0 et 1 (ex: 0.20 = 20%)');
+    }
+    if (CONFIG.SCALP_TICK <= 0 || CONFIG.SCALP_TICK > 0.1) {
+        errors.push('SCALP_TICK doit être entre 0.001 et 0.1');
+    }
     return errors;
 }
 

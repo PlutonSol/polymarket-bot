@@ -10,8 +10,27 @@ function formatTime() {
     return new Date().toISOString().replace('T', ' ').slice(0, 19);
 }
 
+// Patterns de secrets à masquer dans les logs
+const SECRET_PATTERNS = [
+    /0x[a-fA-F0-9]{64}/g,                    // Private keys
+    /sk-[a-zA-Z0-9]{20,}/g,                  // OpenAI API keys
+    /sk-ant-[a-zA-Z0-9-]{20,}/g,             // Anthropic API keys
+    /\b\d{8,}:[A-Za-z0-9_-]{30,}\b/g,        // Telegram bot tokens
+];
+
+function sanitize(str) {
+    if (typeof str !== 'string') return str;
+    let result = str;
+    for (const pattern of SECRET_PATTERNS) {
+        result = result.replace(pattern, '***REDACTED***');
+    }
+    return result;
+}
+
 function writeLog(level, ...args) {
-    const msg = `[${formatTime()}] [${level}] ${args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ')}`;
+    const raw = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
+    const safe = sanitize(raw);
+    const msg = `[${formatTime()}] [${level}] ${safe}`;
     console.log(msg);
     try {
         fs.appendFileSync(LOG_FILE, msg + '\n');

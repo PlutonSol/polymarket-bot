@@ -314,10 +314,17 @@ class PolymarketClient {
     /**
      * Récupère le solde USDC du wallet sur Polygon.
      * En DRY_RUN retourne une balance simulée.
+     * Cache de 30s pour éviter de spammer le RPC.
      */
     async getWalletBalance() {
         if (CONFIG.DRY_RUN) {
             return this._dryRunBalance;
+        }
+
+        // Cache 30s
+        const now = Date.now();
+        if (this._balanceCache && now - this._balanceCacheTime < 30_000) {
+            return this._balanceCache;
         }
 
         try {
@@ -331,11 +338,13 @@ class PolymarketClient {
             const raw = await usdc.balanceOf(CONFIG.WALLET_ADDRESS);
             // USDC a 6 decimales
             const balance = parseFloat(ethers.utils.formatUnits(raw, 6));
+            this._balanceCache = balance;
+            this._balanceCacheTime = now;
             log.info(`Wallet balance: $${balance.toFixed(2)} USDC`);
             return balance;
         } catch (error) {
             log.error('Erreur balance:', error.message);
-            return 0;
+            return this._balanceCache || 0;
         }
     }
 
@@ -346,11 +355,12 @@ class PolymarketClient {
         const balance = await this.getWalletBalance();
         const maxFromWallet = balance * CONFIG.MAX_WALLET_EXPOSURE;
         const maxSize = Math.min(maxFromWallet, CONFIG.MAX_TRADE_SIZE);
-        return Math.max(maxSize, 0); // jamais négatif
+        return Math.max(maxSize, 0);
     }
 }
 
-// Balance simulée en DRY_RUN
 PolymarketClient.prototype._dryRunBalance = 1000;
+PolymarketClient.prototype._balanceCache = null;
+PolymarketClient.prototype._balanceCacheTime = 0;
 
 module.exports = PolymarketClient;

@@ -6,8 +6,8 @@ const TelegramBot = require('node-telegram-bot-api');
 // ============================================
 const CONFIG = {
     TARGET_WALLET: '0x594edb9112f526fa6a80b8f858a6379c8a2c1c11',
-    TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '8525426243:AAHfQdqz1jUD4algSX15z2SHvsziOG0rxxs',
-    TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '410866851',
+    TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
+    TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',
     CHECK_INTERVAL: 10000, // 10 secondes (plus rapide)
     MIN_TRADE_USD: 10, // Ignorer trades < $10
 };
