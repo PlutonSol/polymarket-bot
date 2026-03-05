@@ -3,7 +3,7 @@ const { CONFIG } = require('./config');
 const log = require('./logger');
 
 /**
- * Bot Telegram - Interface de contrôle pour le trading bot
+ * Bot Telegram - Interface de contrôle pour le scalping bot
  */
 class TelegramController {
     constructor(tradingEngine, polyClient, llmAnalyzer) {
@@ -16,242 +16,284 @@ class TelegramController {
     async initialize() {
         this.bot = new TelegramBot(CONFIG.TELEGRAM_BOT_TOKEN, { polling: true });
         this._setupCommands();
-        log.info('Bot Telegram initialisé');
+        log.info('Telegram initialisé');
 
-        await this.send(`🤖 *Polymarket LLM Trading Bot v6.0*
+        await this.send(`🤖 *Polymarket Scalping Bot v7.0*
 
-🧠 *Powered by:* ${CONFIG.LLM_PROVIDER} (${CONFIG.LLM_MODEL})
-💰 *Mode:* ${CONFIG.DRY_RUN ? '🧪 DRY RUN (simulation)' : '🔴 LIVE TRADING'}
+🧠 *LLM:* ${CONFIG.LLM_PROVIDER} (${CONFIG.LLM_MODEL})
+💰 *Mode:* ${CONFIG.DRY_RUN ? '🧪 DRY RUN' : '🔴 LIVE'}
+📊 *Stratégie:* Buy + Sell +${CONFIG.SCALP_TICK * 100}c
 🎯 *Volume cible:* $${CONFIG.DAILY_VOLUME_TARGET}/jour
-📊 *Taille trades:* $${CONFIG.MIN_TRADE_SIZE} - $${CONFIG.MAX_TRADE_SIZE}
+💵 *Taille scalp:* $${CONFIG.TRADE_SIZE_USD}
+📈 *Min volume marché:* $${(CONFIG.MIN_MARKET_VOLUME / 1e6).toFixed(0)}M
 
 📋 *Commandes:*
-/start\\_trade - Démarrer le trading auto
-/stop\\_trade - Arrêter le trading
+/start\\_scalp - Démarrer le scalping
+/stop\\_scalp - Arrêter
 /status - État du bot
+/markets - Marchés éligibles (>1M vol)
+/scan - Scanner les opportunités (LLM)
 /trades - Trades du jour
-/positions - Positions ouvertes
-/analyze - Analyser les marchés (LLM)
-/markets - Top marchés actifs
+/active - Scalps actifs (positions ouvertes)
+/retry - Retenter les sells échoués
 /volume - Volume du jour
+/setsize X - Changer taille scalp
 /setvolume X - Changer volume cible
-/setsize X - Changer taille max trade
-/dryrun - Basculer mode dry run
+/dryrun - Basculer dry run/live
 /cancel\\_all - Annuler tous les ordres`);
     }
 
-    _isAuthorized(msg) {
+    _auth(msg) {
         return msg.chat.id.toString() === CONFIG.TELEGRAM_CHAT_ID;
     }
 
     _setupCommands() {
-        // === TRADING CONTROLS ===
+        // === SCALPING CONTROLS ===
 
-        this.bot.onText(/\/start_trade/, async (msg) => {
-            if (!this._isAuthorized(msg)) return;
+        this.bot.onText(/\/start_scalp/, async (msg) => {
+            if (!this._auth(msg)) return;
             const result = await this.engine.start();
-            await this.send(`🟢 ${result}`);
+            await this.send(`🟢 ${result}\nIntervalle: ${CONFIG.SCALP_INTERVAL / 1000}s`);
         });
 
-        this.bot.onText(/\/stop_trade/, async (msg) => {
-            if (!this._isAuthorized(msg)) return;
+        this.bot.onText(/\/stop_scalp/, async (msg) => {
+            if (!this._auth(msg)) return;
             const result = this.engine.stop();
             await this.send(`🔴 ${result}`);
         });
 
-        // === STATUS & INFO ===
+        // === STATUS ===
 
         this.bot.onText(/\/status/, async (msg) => {
-            if (!this._isAuthorized(msg)) return;
+            if (!this._auth(msg)) return;
             const s = this.engine.getStatus();
-            const progressBar = this._makeProgressBar(parseFloat(s.dailyProgress));
-            await this.send(`📊 *Status Bot*
+            const bar = this._bar(parseFloat(s.dailyProgress));
+            await this.send(`📊 *Status Scalping Bot*
 
 🔄 État: ${s.isRunning ? '🟢 Actif' : '🔴 Arrêté'}
 🧪 Mode: ${s.mode}
 🧠 LLM: ${CONFIG.LLM_PROVIDER} (${CONFIG.LLM_MODEL})
 
-💰 *Volume du jour:*
-${progressBar} ${s.dailyProgress}%
-$${s.dailyVolume.toFixed(2)} / $${s.dailyTarget}
+💰 *Volume:*
+${bar} ${s.dailyProgress}%
+$${s.dailyVolume.toFixed(0)} / $${s.dailyTarget}
 
-📈 *Stats:*
-• Trades aujourd'hui: ${s.dailyTradeCount}
-• Positions ouvertes: ${s.openPositions}
-• Cycles exécutés: ${s.totalCycles}
+⚡ *Scalping:*
+• Tick: +${s.scalpTick * 100}c (buy → sell +${s.scalpTick * 100}c)
+• Taille: $${s.tradeSize}
+• Min volume marché: $${(s.minVolume / 1e6).toFixed(0)}M
+• Scalps complets: ${s.dailyScalps}
+• Profit théorique: $${s.dailyProfit.toFixed(4)}
+• Scalps actifs: ${s.activeScalps}
+• Cycles: ${s.totalCycles}
 
-📊 *Global:*
-• Total trades: ${s.stats.totalTrades}
-• Volume total: $${s.stats.totalVolume.toFixed(2)}
-• Réussis: ${s.stats.successfulTrades}
-• Échoués: ${s.stats.failedTrades}
+📈 *Global:*
+• Total scalps: ${s.stats.totalScalps}
+• Complets: ${s.stats.completedScalps}
+• Échoués: ${s.stats.failedScalps}
+• Volume total: $${s.stats.totalVolume.toFixed(0)}
 • Appels LLM: ${s.stats.llmCalls}`);
         });
 
+        // === MARCHÉS ===
+
+        this.bot.onText(/\/markets/, async (msg) => {
+            if (!this._auth(msg)) return;
+            await this.send('🔍 Recherche marchés >= $1M...');
+
+            try {
+                this.poly.invalidateCache();
+                const markets = await this.poly.getCachedHighVolumeMarkets();
+                if (markets.length === 0) {
+                    return await this.send('❌ Aucun marché >= $1M trouvé');
+                }
+
+                let text = `📊 *Marchés éligibles (>=$1M vol):*\n\n`;
+                for (const m of markets.slice(0, 10)) {
+                    const title = (m.question || 'N/A').slice(0, 45);
+                    const vol = parseFloat(m.volume || m.volumeNum || 0);
+                    const vol24 = parseFloat(m.volume24hr || 0);
+                    text += `📌 ${title}\n`;
+                    text += `   Vol: $${(vol / 1e6).toFixed(1)}M | 24h: $${(vol24 / 1e3).toFixed(0)}K\n\n`;
+                }
+                text += `_Total: ${markets.length} marchés_`;
+                await this.send(text);
+            } catch (error) {
+                await this.send(`❌ ${error.message}`);
+            }
+        });
+
+        // === SCAN LLM ===
+
+        this.bot.onText(/\/scan/, async (msg) => {
+            if (!this._auth(msg)) return;
+            await this.send('🧠 Scan en cours (LLM + orderbooks)...');
+
+            try {
+                const markets = await this.poly.getCachedHighVolumeMarkets();
+                if (markets.length === 0) {
+                    return await this.send('❌ Aucun marché éligible');
+                }
+
+                const enriched = (await Promise.all(
+                    markets.slice(0, 8).map(m => this.poly.enrichForScalping(m).catch(() => null))
+                )).filter(Boolean);
+
+                if (enriched.length === 0) {
+                    return await this.send('❌ Aucun orderbook dispo');
+                }
+
+                // Pre-filtrer
+                const viable = enriched.filter(m => {
+                    const yesOk = m.yesBook && m.yesBook.spreadCents >= CONFIG.SCALP_TICK * 100;
+                    const noOk = m.noBook && m.noBook.spreadCents >= CONFIG.SCALP_TICK * 100;
+                    return yesOk || noOk;
+                });
+
+                let text = `📊 *Scan Orderbooks (${enriched.length} marchés):*\n\n`;
+
+                for (const m of enriched.slice(0, 6)) {
+                    const title = (m.question || 'N/A').slice(0, 40);
+                    text += `📌 *${title}*\n`;
+                    text += `   Vol: $${(m.totalVolume / 1e6).toFixed(1)}M\n`;
+
+                    if (m.yesBook) {
+                        const y = m.yesBook;
+                        const tag = y.spreadCents >= CONFIG.SCALP_TICK * 100 ? '✅' : '❌';
+                        text += `   YES: bid=${y.bestBid} ask=${y.bestAsk} spread=${y.spreadCents}c ${tag}\n`;
+                        text += `   Depth: bid=$${y.bidDepthUsd.toFixed(0)} ask=$${y.askDepthUsd.toFixed(0)}\n`;
+                    }
+                    if (m.noBook) {
+                        const n = m.noBook;
+                        const tag = n.spreadCents >= CONFIG.SCALP_TICK * 100 ? '✅' : '❌';
+                        text += `   NO:  bid=${n.bestBid} ask=${n.bestAsk} spread=${n.spreadCents}c ${tag}\n`;
+                        text += `   Depth: bid=$${n.bidDepthUsd.toFixed(0)} ask=$${n.askDepthUsd.toFixed(0)}\n`;
+                    }
+                    text += '\n';
+                }
+
+                if (viable.length === 0) {
+                    text += `\n⚠️ _Aucun marché avec spread >= ${CONFIG.SCALP_TICK * 100}c_`;
+                    await this.send(text);
+                    return;
+                }
+
+                // Appel LLM
+                const { targets, skipped } = await this.llm.selectScalpTargets(viable);
+
+                if (targets.length > 0) {
+                    text += `\n🎯 *Targets LLM (${targets.length}):*\n`;
+                    for (const t of targets) {
+                        text += `\n⚡ *${(t.market || '').slice(0, 35)}*\n`;
+                        text += `   ${t.token?.toUpperCase()} | Buy: ${t.buyPrice} → Sell: ${t.sellPrice}\n`;
+                        text += `   Taille: $${t.sizeUsd} | Score: ${t.score}/100\n`;
+                        text += `   _${t.reason || ''}_\n`;
+                    }
+                } else {
+                    text += `\n⚠️ _LLM: aucun target viable_`;
+                }
+
+                await this.send(text);
+            } catch (error) {
+                await this.send(`❌ ${error.message}`);
+            }
+        });
+
+        // === TRADES ===
+
         this.bot.onText(/\/trades/, async (msg) => {
-            if (!this._isAuthorized(msg)) return;
+            if (!this._auth(msg)) return;
             const trades = this.engine.getDailyTrades();
             if (trades.length === 0) {
                 return await this.send('📋 Aucun trade aujourd\'hui');
             }
 
             let text = `📋 *Trades du jour (${trades.length}):*\n\n`;
-            for (const t of trades.slice(-10)) {
-                const emoji = t.side === 'buy' ? '🟢' : '🔴';
-                const market = (t.marketTitle || 'N/A').slice(0, 35);
-                text += `${emoji} ${t.side.toUpperCase()} $${parseFloat(t.size).toFixed(2)} @ ${parseFloat(t.price).toFixed(2)}\n`;
-                text += `   ${market}\n`;
-                text += `   ${t.executedAt?.slice(11, 19) || ''}\n\n`;
+            for (const t of trades.slice(-15)) {
+                const emoji = t.type === 'scalp-buy' ? '🟢 BUY' : '🔴 SELL';
+                const market = (t.market || 'N/A').slice(0, 30);
+                text += `${emoji} ${t.shares} @ ${t.price} ($${t.usd.toFixed(2)})\n`;
+                text += `   ${market} | ${t.time?.slice(11, 19) || ''}\n\n`;
             }
             await this.send(text);
         });
 
-        this.bot.onText(/\/positions/, async (msg) => {
-            if (!this._isAuthorized(msg)) return;
-            const positions = this.engine.getOpenPositions();
-            const keys = Object.keys(positions);
-            if (keys.length === 0) {
-                return await this.send('📊 Aucune position ouverte');
+        this.bot.onText(/\/active/, async (msg) => {
+            if (!this._auth(msg)) return;
+            const active = this.engine.getActiveScalps();
+            if (active.length === 0) {
+                return await this.send('✅ Aucun scalp actif (pas de position ouverte)');
             }
 
-            let text = `📊 *Positions ouvertes (${keys.length}):*\n\n`;
-            for (const [tokenId, pos] of Object.entries(positions)) {
-                const emoji = pos.side === 'buy' ? '🟢' : '🔴';
-                text += `${emoji} ${pos.side.toUpperCase()} - ${pos.size.toFixed(2)} shares @ ${pos.avgPrice.toFixed(2)}\n`;
-                text += `   Token: ${tokenId.slice(0, 12)}...\n\n`;
+            let text = `⚠️ *Scalps actifs (positions ouvertes):*\n\n`;
+            for (const s of active) {
+                text += `📌 ${(s.market || 'N/A').slice(0, 35)}\n`;
+                text += `   Buy: ${s.buyPrice} | Sell cible: ${s.sellPrice}\n`;
+                text += `   ${s.shares} shares | ${s.time?.slice(11, 19) || ''}\n\n`;
             }
+            text += `\nUtilise /retry pour retenter les sells`;
             await this.send(text);
         });
+
+        this.bot.onText(/\/retry/, async (msg) => {
+            if (!this._auth(msg)) return;
+            const result = await this.engine.retryFailedScalps();
+            await this.send(`🔄 ${result}`);
+        });
+
+        // === VOLUME ===
 
         this.bot.onText(/\/volume/, async (msg) => {
-            if (!this._isAuthorized(msg)) return;
+            if (!this._auth(msg)) return;
             const s = this.engine.getStatus();
-            const progressBar = this._makeProgressBar(parseFloat(s.dailyProgress));
+            const bar = this._bar(parseFloat(s.dailyProgress));
             await this.send(`💰 *Volume du jour*
 
-${progressBar}
-$${s.dailyVolume.toFixed(2)} / $${s.dailyTarget} (${s.dailyProgress}%)
+${bar}
+$${s.dailyVolume.toFixed(0)} / $${s.dailyTarget} (${s.dailyProgress}%)
 
-📊 ${s.dailyTradeCount} trades exécutés`);
-        });
-
-        // === LLM ANALYSIS ===
-
-        this.bot.onText(/\/analyze/, async (msg) => {
-            if (!this._isAuthorized(msg)) return;
-            await this.send('🧠 Analyse en cours...');
-
-            try {
-                const markets = await this.poly.getCachedMarkets(15);
-                const enriched = (await Promise.all(
-                    markets.slice(0, 8).map(m => this.poly.enrichMarketData(m).catch(() => null))
-                )).filter(Boolean);
-
-                if (enriched.length === 0) {
-                    return await this.send('❌ Aucun marché disponible');
-                }
-
-                const analysis = await this.llm.analyzeMarkets(enriched);
-                if (!analysis) {
-                    return await this.send('❌ Erreur analyse LLM');
-                }
-
-                let text = `🧠 *Analyse LLM*\n\n`;
-                text += `📝 ${analysis.analysis || 'N/A'}\n\n`;
-
-                if (analysis.trades && analysis.trades.length > 0) {
-                    text += `💡 *Trades recommandés:*\n`;
-                    for (const t of analysis.trades.slice(0, 5)) {
-                        const emoji = t.side === 'buy' ? '🟢' : '🔴';
-                        text += `\n${emoji} ${t.side.toUpperCase()} ${t.outcome} @ ${t.price}`;
-                        text += ` ($${t.size}) - ${(t.confidence * 100).toFixed(0)}%\n`;
-                        text += `   ${(t.marketTitle || '').slice(0, 40)}\n`;
-                        text += `   _${t.reason || ''}_\n`;
-                    }
-                }
-
-                if (analysis.marketInsights && analysis.marketInsights.length > 0) {
-                    text += `\n🔍 *Insights:*\n`;
-                    for (const i of analysis.marketInsights.slice(0, 3)) {
-                        text += `• ${i.insight}\n`;
-                    }
-                }
-
-                await this.send(text);
-            } catch (error) {
-                await this.send(`❌ Erreur: ${error.message}`);
-            }
-        });
-
-        this.bot.onText(/\/markets/, async (msg) => {
-            if (!this._isAuthorized(msg)) return;
-            await this.send('🔍 Récupération des marchés...');
-
-            try {
-                const markets = await this.poly.getCachedMarkets(10);
-                const enriched = (await Promise.all(
-                    markets.slice(0, 8).map(m => this.poly.enrichMarketData(m).catch(() => null))
-                )).filter(Boolean);
-
-                let text = `📊 *Top marchés Polymarket:*\n\n`;
-                for (const m of enriched) {
-                    const title = (m.question || m.title || 'N/A').slice(0, 45);
-                    const spread = m.spread !== null ? `${m.spread.toFixed(1)}%` : 'N/A';
-                    text += `📌 ${title}\n`;
-                    text += `   Yes: ${m.yesMid ? (m.yesMid * 100).toFixed(0) + '¢' : 'N/A'}`;
-                    text += ` | Spread: ${spread}`;
-                    text += ` | Vol: $${(m.volume24h || 0).toFixed(0)}\n\n`;
-                }
-                await this.send(text);
-            } catch (error) {
-                await this.send(`❌ Erreur: ${error.message}`);
-            }
+⚡ ${s.dailyScalps} scalps complets
+💵 Profit: $${s.dailyProfit.toFixed(4)}`);
         });
 
         // === SETTINGS ===
 
-        this.bot.onText(/\/setvolume (.+)/, async (msg, match) => {
-            if (!this._isAuthorized(msg)) return;
-            const value = parseFloat(match[1]);
-            if (isNaN(value) || value <= 0) {
-                return await this.send('❌ Valeur invalide. Ex: /setvolume 2000');
-            }
-            CONFIG.DAILY_VOLUME_TARGET = value;
-            await this.send(`✅ Volume cible: *$${value}*/jour`);
+        this.bot.onText(/\/setsize (.+)/, async (msg, match) => {
+            if (!this._auth(msg)) return;
+            const v = parseFloat(match[1]);
+            if (isNaN(v) || v <= 0) return await this.send('❌ Ex: /setsize 100');
+            CONFIG.TRADE_SIZE_USD = v;
+            await this.send(`✅ Taille scalp: *$${v}*`);
         });
 
-        this.bot.onText(/\/setsize (.+)/, async (msg, match) => {
-            if (!this._isAuthorized(msg)) return;
-            const value = parseFloat(match[1]);
-            if (isNaN(value) || value <= 0) {
-                return await this.send('❌ Valeur invalide. Ex: /setsize 100');
-            }
-            CONFIG.MAX_TRADE_SIZE = value;
-            await this.send(`✅ Taille max trade: *$${value}*`);
+        this.bot.onText(/\/setvolume (.+)/, async (msg, match) => {
+            if (!this._auth(msg)) return;
+            const v = parseFloat(match[1]);
+            if (isNaN(v) || v <= 0) return await this.send('❌ Ex: /setvolume 5000');
+            CONFIG.DAILY_VOLUME_TARGET = v;
+            await this.send(`✅ Volume cible: *$${v}*/jour`);
         });
 
         this.bot.onText(/\/dryrun/, async (msg) => {
-            if (!this._isAuthorized(msg)) return;
+            if (!this._auth(msg)) return;
             CONFIG.DRY_RUN = !CONFIG.DRY_RUN;
-            const mode = CONFIG.DRY_RUN ? '🧪 DRY RUN (simulation)' : '🔴 LIVE TRADING';
-            await this.send(`✅ Mode: ${mode}`);
+            await this.send(`✅ Mode: ${CONFIG.DRY_RUN ? '🧪 DRY RUN' : '🔴 LIVE TRADING'}`);
         });
 
         this.bot.onText(/\/cancel_all/, async (msg) => {
-            if (!this._isAuthorized(msg)) return;
+            if (!this._auth(msg)) return;
             try {
                 await this.poly.cancelAllOrders();
-                await this.send('✅ Tous les ordres ont été annulés');
+                await this.send('✅ Tous les ordres annulés');
             } catch (error) {
-                await this.send(`❌ Erreur: ${error.message}`);
+                await this.send(`❌ ${error.message}`);
             }
         });
     }
 
-    _makeProgressBar(percent) {
-        const filled = Math.round(percent / 5);
-        const empty = 20 - Math.min(filled, 20);
-        return '▓'.repeat(Math.min(filled, 20)) + '░'.repeat(empty);
+    _bar(pct) {
+        const f = Math.round(pct / 5);
+        return '▓'.repeat(Math.min(f, 20)) + '░'.repeat(20 - Math.min(f, 20));
     }
 
     async send(message) {
@@ -261,22 +303,17 @@ $${s.dailyVolume.toFixed(2)} / $${s.dailyTarget} (${s.dailyProgress}%)
                 disable_web_page_preview: true,
             });
         } catch (error) {
-            log.error('Telegram error:', error.message);
+            log.error('Telegram:', error.message);
         }
     }
 
-    /**
-     * Envoie une notification de trade
-     */
-    async notifyTrade(trade) {
-        const emoji = trade.side === 'buy' ? '🟢 ACHAT' : '🔴 VENTE';
-        const market = (trade.marketTitle || 'N/A').slice(0, 60);
-        await this.send(`🔔 *Trade exécuté*
+    async notifyScalp(data) {
+        await this.send(`⚡ *Scalp exécuté!*
 
-${emoji} ${trade.outcome || ''}
-📊 ${market}
-💰 $${parseFloat(trade.size).toFixed(2)} @ ${parseFloat(trade.price).toFixed(2)}
-🆔 ${trade.orderId || 'N/A'}`);
+📊 ${(data.market || 'N/A').slice(0, 50)}
+🟢 BUY @ ${data.buyPrice} → 🔴 SELL @ ${data.sellPrice}
+💵 Volume: $${data.volume?.toFixed(2) || '?'}
+💰 Profit: +$${data.profit?.toFixed(4) || '?'}`);
     }
 }
 

@@ -7,13 +7,14 @@ const TelegramController = require('./src/telegram-bot');
 
 async function main() {
     console.log(`
-╔══════════════════════════════════════════╗
-║   🤖 Polymarket LLM Trading Bot v6.0    ║
-║   Powered by ${CONFIG.LLM_PROVIDER.toUpperCase().padEnd(10)} + CLOB API     ║
-╚══════════════════════════════════════════╝
+╔══════════════════════════════════════════════╗
+║   ⚡ Polymarket Scalping Bot v7.0            ║
+║   Buy @ bid → Sell @ bid+${(CONFIG.SCALP_TICK * 100).toFixed(0)}c              ║
+║   Marchés >= $${(CONFIG.MIN_MARKET_VOLUME / 1e6).toFixed(0)}M volume uniquement       ║
+║   LLM: ${CONFIG.LLM_PROVIDER.toUpperCase().padEnd(10)}                         ║
+╚══════════════════════════════════════════════╝
 `);
 
-    // 1. Valider la configuration
     const errors = validateConfig();
     if (errors.length > 0) {
         console.error('❌ Erreurs de configuration:');
@@ -22,12 +23,13 @@ async function main() {
         process.exit(1);
     }
 
-    log.info('Configuration validée');
-    log.info(`Mode: ${CONFIG.DRY_RUN ? 'DRY RUN (simulation)' : 'LIVE TRADING'}`);
-    log.info(`LLM: ${CONFIG.LLM_PROVIDER} (${CONFIG.LLM_MODEL})`);
+    log.info('Configuration OK');
+    log.info(`Mode: ${CONFIG.DRY_RUN ? 'DRY RUN' : 'LIVE TRADING'}`);
+    log.info(`Stratégie: Buy @ best bid → Sell @ +${CONFIG.SCALP_TICK * 100}c`);
+    log.info(`Taille: $${CONFIG.TRADE_SIZE_USD} par scalp`);
     log.info(`Volume cible: $${CONFIG.DAILY_VOLUME_TARGET}/jour`);
+    log.info(`Min volume marché: $${(CONFIG.MIN_MARKET_VOLUME / 1e6).toFixed(0)}M`);
 
-    // 2. Initialiser les composants
     const polyClient = new PolymarketClient();
     await polyClient.initialize();
 
@@ -37,28 +39,22 @@ async function main() {
 
     await telegram.initialize();
 
-    log.info('Tous les composants initialisés');
-    log.info('En attente de commandes Telegram...');
+    log.info('Bot prêt - en attente de commandes Telegram');
 
-    // Gestion propre de l'arrêt
     const shutdown = async (signal) => {
-        log.info(`Signal ${signal} reçu - arrêt en cours...`);
+        log.info(`${signal} - arrêt...`);
         tradingEngine.stop();
-        await telegram.send('⚠️ Bot arrêté (signal système)');
+        await telegram.send('⚠️ Bot arrêté');
         process.exit(0);
     };
 
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
-    process.on('uncaughtException', (error) => {
-        log.error('Uncaught exception:', error.message);
-    });
-    process.on('unhandledRejection', (error) => {
-        log.error('Unhandled rejection:', error.message || error);
-    });
+    process.on('uncaughtException', (e) => log.error('Uncaught:', e.message));
+    process.on('unhandledRejection', (e) => log.error('Unhandled:', e.message || e));
 }
 
-main().catch(error => {
-    console.error('❌ Erreur fatale:', error);
+main().catch(e => {
+    console.error('❌ Fatal:', e);
     process.exit(1);
 });

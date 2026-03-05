@@ -2,296 +2,324 @@ const { CONFIG } = require('./config');
 const log = require('./logger');
 
 /**
- * Moteur de trading - Gère l'exécution des trades, le risk management et le suivi du volume
+ * Moteur de scalping - Achète au best bid et revend immédiatement +0.01
+ * Cible uniquement les marchés avec volume >= 1M
  */
 class TradingEngine {
     constructor(polyClient, llmAnalyzer) {
         this.poly = polyClient;
         this.llm = llmAnalyzer;
         this.isRunning = false;
-        this.tradingLoop = null;
+        this.loopTimeout = null;
 
-        // État du trading
+        // État
         this.state = {
             dailyVolume: 0,
             dailyTrades: [],
-            dailyPnL: 0,
-            openPositions: new Map(), // tokenId -> { side, size, avgPrice }
-            pendingOrders: new Map(), // orderId -> order
+            dailyScalps: 0,        // Nombre de scalps complets (buy+sell)
+            dailyProfit: 0,        // Profit théorique des scalps
+            activeScalps: [],      // Scalps en cours (buy placé, en attente de sell)
             lastResetDate: new Date().toDateString(),
             totalCycles: 0,
         };
 
-        // Stats
         this.stats = {
-            totalTrades: 0,
+            totalScalps: 0,
             totalVolume: 0,
-            successfulTrades: 0,
-            failedTrades: 0,
+            completedScalps: 0,    // Buy + Sell réussis
+            failedScalps: 0,       // Sell non exécuté
             llmCalls: 0,
         };
     }
 
-    /**
-     * Démarre la boucle de trading automatique
-     */
     async start() {
         if (this.isRunning) return 'Déjà en cours';
         this.isRunning = true;
-        log.info('Démarrage du moteur de trading');
+        log.info('Scalping démarré');
         this._runLoop();
-        return 'Moteur de trading démarré';
+        return 'Scalping démarré';
     }
 
-    /**
-     * Arrête la boucle de trading
-     */
     stop() {
         this.isRunning = false;
-        if (this.tradingLoop) {
-            clearTimeout(this.tradingLoop);
-            this.tradingLoop = null;
+        if (this.loopTimeout) {
+            clearTimeout(this.loopTimeout);
+            this.loopTimeout = null;
         }
-        log.info('Moteur de trading arrêté');
-        return 'Moteur de trading arrêté';
+        log.info('Scalping arrêté');
+        return 'Scalping arrêté';
     }
 
-    /**
-     * Boucle principale de trading
-     */
     async _runLoop() {
         while (this.isRunning) {
             try {
                 this._checkDayReset();
-                await this._executeTradingCycle();
+                await this._executeScalpCycle();
                 this.state.totalCycles++;
             } catch (error) {
-                log.error('Erreur cycle trading:', error.message);
+                log.error('Erreur cycle:', error.message);
             }
 
             if (this.isRunning) {
                 await new Promise(r => {
-                    this.tradingLoop = setTimeout(r, CONFIG.TRADING_INTERVAL);
+                    this.loopTimeout = setTimeout(r, CONFIG.SCALP_INTERVAL);
                 });
             }
         }
     }
 
-    /**
-     * Reset les stats quotidiennes si nouveau jour
-     */
     _checkDayReset() {
         const today = new Date().toDateString();
         if (today !== this.state.lastResetDate) {
-            log.info('Nouveau jour - reset des stats quotidiennes');
+            log.info('Reset journalier');
             this.state.dailyVolume = 0;
             this.state.dailyTrades = [];
-            this.state.dailyPnL = 0;
+            this.state.dailyScalps = 0;
+            this.state.dailyProfit = 0;
             this.state.lastResetDate = today;
         }
     }
 
     /**
-     * Exécute un cycle de trading complet
+     * Cycle de scalping principal:
+     * 1. Récupérer marchés >= 1M volume
+     * 2. Enrichir avec orderbook
+     * 3. LLM sélectionne les meilleurs targets
+     * 4. Exécuter les scalps (buy + sell immédiat à +0.01)
      */
-    async _executeTradingCycle() {
-        // Vérifier si le volume cible est atteint
+    async _executeScalpCycle() {
         if (this.state.dailyVolume >= CONFIG.DAILY_VOLUME_TARGET) {
-            log.info(`Volume cible atteint: $${this.state.dailyVolume.toFixed(2)} / $${CONFIG.DAILY_VOLUME_TARGET}`);
+            log.info(`Volume cible atteint: $${this.state.dailyVolume.toFixed(0)} / $${CONFIG.DAILY_VOLUME_TARGET}`);
             return;
         }
 
-        log.info(`=== Cycle #${this.state.totalCycles + 1} | Volume: $${this.state.dailyVolume.toFixed(2)} / $${CONFIG.DAILY_VOLUME_TARGET} ===`);
+        log.info(`=== Cycle #${this.state.totalCycles + 1} | Vol: $${this.state.dailyVolume.toFixed(0)}/$${CONFIG.DAILY_VOLUME_TARGET} | Scalps: ${this.state.dailyScalps} ===`);
 
-        // 1. Récupérer les marchés actifs
-        const markets = await this.poly.getCachedMarkets(30);
+        // 1. Récupérer marchés à gros volume
+        const markets = await this.poly.getCachedHighVolumeMarkets();
         if (markets.length === 0) {
-            log.warn('Aucun marché actif trouvé');
+            log.warn('Aucun marché >= $1M trouvé');
             return;
         }
+        log.info(`${markets.length} marchés >= $1M volume`);
 
-        // 2. Enrichir avec les données de prix (en parallèle, limité à 10)
-        const marketsToEnrich = markets.slice(0, 10);
+        // 2. Enrichir avec orderbooks (max 8 en parallèle)
+        const toEnrich = markets.slice(0, 8);
         const enriched = (await Promise.all(
-            marketsToEnrich.map(m => this.poly.enrichMarketData(m).catch(() => null))
+            toEnrich.map(m => this.poly.enrichForScalping(m).catch(() => null))
         )).filter(Boolean);
 
         if (enriched.length === 0) {
-            log.warn('Aucune donnée de prix disponible');
+            log.warn('Aucun orderbook disponible');
             return;
         }
 
-        // 3. Demander au LLM une stratégie de volume
+        // Pre-filtrer: garder seulement ceux avec un spread >= 1 cent sur au moins un token
+        const viable = enriched.filter(m => {
+            const yesOk = m.yesBook && m.yesBook.spreadCents >= CONFIG.SCALP_TICK * 100;
+            const noOk = m.noBook && m.noBook.spreadCents >= CONFIG.SCALP_TICK * 100;
+            return yesOk || noOk;
+        });
+
+        if (viable.length === 0) {
+            log.info('Aucun marché avec spread suffisant pour scalper');
+            return;
+        }
+
+        log.info(`${viable.length} marchés avec spread >= ${CONFIG.SCALP_TICK * 100}c`);
+
+        // 3. LLM sélectionne les meilleurs targets
         this.stats.llmCalls++;
-        const strategy = await this.llm.generateVolumeStrategy(
-            enriched,
-            this.state.dailyVolume,
-            CONFIG.DAILY_VOLUME_TARGET
-        );
+        const { targets, skipped } = await this.llm.selectScalpTargets(viable);
 
-        if (!strategy || !strategy.trades || strategy.trades.length === 0) {
-            log.warn('LLM n\'a proposé aucun trade');
+        if (targets.length === 0) {
+            log.info('LLM: aucun target viable');
+            if (skipped.length > 0) log.info('Skip:', skipped.join(' | '));
             return;
         }
 
-        log.info(`Stratégie: ${strategy.strategy || 'N/A'} - ${strategy.trades.length} trades proposés`);
+        log.info(`${targets.length} targets sélectionnés par LLM`);
 
-        // 4. Exécuter les trades
-        for (const trade of strategy.trades) {
+        // 4. Exécuter les scalps
+        const maxScalps = Math.min(targets.length, CONFIG.MAX_CONCURRENT_SCALPS);
+        for (let i = 0; i < maxScalps; i++) {
             if (!this.isRunning) break;
             if (this.state.dailyVolume >= CONFIG.DAILY_VOLUME_TARGET) break;
 
-            await this._executeTrade(trade);
+            const target = targets[i];
+            await this._executeScalp(target);
 
-            // Pause entre les trades pour éviter le rate limiting
-            await new Promise(r => setTimeout(r, 2000));
+            // Petite pause entre scalps
+            if (i < maxScalps - 1) {
+                await new Promise(r => setTimeout(r, 1500));
+            }
         }
     }
 
     /**
-     * Exécute un trade individuel avec validation
+     * Exécute un scalp complet: BUY au bestBid puis SELL à bestBid + 0.01
      */
-    async _executeTrade(trade) {
-        try {
-            // Validation de base
-            if (!trade.tokenId || !trade.side || !trade.price || !trade.size) {
-                log.warn('Trade invalide - champs manquants:', trade);
-                return null;
-            }
+    async _executeScalp(target) {
+        const { tokenId, buyPrice, sellPrice, sizeUsd, market } = target;
 
-            const tradeSize = parseFloat(trade.size);
-            const tradePrice = parseFloat(trade.price);
-
-            // Vérifier les limites
-            if (tradeSize < CONFIG.MIN_TRADE_SIZE) {
-                log.warn(`Trade trop petit: $${tradeSize}`);
-                return null;
-            }
-            if (tradeSize > CONFIG.MAX_TRADE_SIZE) {
-                trade.size = CONFIG.MAX_TRADE_SIZE;
-                log.warn(`Trade réduit à max: $${CONFIG.MAX_TRADE_SIZE}`);
-            }
-
-            // Vérifier que le prix est raisonnable (entre 0.01 et 0.99)
-            if (tradePrice < 0.01 || tradePrice > 0.99) {
-                log.warn(`Prix invalide: ${tradePrice}`);
-                return null;
-            }
-
-            // Vérifier le nombre de positions ouvertes
-            if (this.state.openPositions.size >= CONFIG.MAX_OPEN_POSITIONS && trade.type === 'entry') {
-                log.warn('Max positions atteint');
-                return null;
-            }
-
-            // Calculer la taille en shares
-            const shares = tradeSize / tradePrice;
-
-            log.trade(`Exécution: ${trade.side.toUpperCase()} ${shares.toFixed(2)} shares @ ${tradePrice} ($${tradeSize.toFixed(2)}) - ${trade.marketTitle || 'N/A'}`);
-
-            // Placer l'ordre
-            const result = await this.poly.placeOrder({
-                tokenId: trade.tokenId,
-                side: trade.side,
-                price: tradePrice,
-                size: shares,
-            });
-
-            if (result) {
-                const volume = tradeSize;
-                this.state.dailyVolume += volume;
-                this.state.dailyTrades.push({
-                    ...trade,
-                    orderId: result.id,
-                    executedAt: new Date().toISOString(),
-                    volume,
-                });
-                this.stats.totalTrades++;
-                this.stats.totalVolume += volume;
-                this.stats.successfulTrades++;
-
-                // Mettre à jour les positions
-                this._updatePosition(trade);
-
-                log.trade(`Succès - Volume journalier: $${this.state.dailyVolume.toFixed(2)}`);
-                return result;
-            }
-        } catch (error) {
-            log.error(`Erreur trade:`, error.message);
-            this.stats.failedTrades++;
-        }
-        return null;
-    }
-
-    /**
-     * Met à jour le suivi des positions
-     */
-    _updatePosition(trade) {
-        const key = trade.tokenId;
-        const existing = this.state.openPositions.get(key);
-
-        if (trade.type === 'exit' && existing) {
-            this.state.openPositions.delete(key);
+        // Validation
+        if (!tokenId || !buyPrice || !sellPrice) {
+            log.warn('Target invalide:', target);
             return;
         }
 
-        if (trade.side === 'buy') {
-            if (existing && existing.side === 'buy') {
-                // Augmenter la position
-                const totalSize = existing.size + parseFloat(trade.size);
-                const avgPrice = (existing.avgPrice * existing.size + parseFloat(trade.price) * parseFloat(trade.size)) / totalSize;
-                this.state.openPositions.set(key, { side: 'buy', size: totalSize, avgPrice });
-            } else if (existing && existing.side === 'sell') {
-                // Réduire la position short
-                const remaining = existing.size - parseFloat(trade.size);
-                if (remaining <= 0) {
-                    this.state.openPositions.delete(key);
-                } else {
-                    this.state.openPositions.set(key, { ...existing, size: remaining });
-                }
-            } else {
-                this.state.openPositions.set(key, {
-                    side: 'buy',
-                    size: parseFloat(trade.size),
-                    avgPrice: parseFloat(trade.price),
-                });
+        const priceDiff = +(sellPrice - buyPrice).toFixed(4);
+        if (Math.abs(priceDiff - CONFIG.SCALP_TICK) > 0.005) {
+            log.warn(`Tick invalide: buy=${buyPrice} sell=${sellPrice} diff=${priceDiff}`);
+            return;
+        }
+
+        const size = Math.min(Math.max(sizeUsd || CONFIG.TRADE_SIZE_USD, CONFIG.MIN_TRADE_SIZE), CONFIG.MAX_TRADE_SIZE);
+        const shares = +(size / buyPrice).toFixed(2);
+
+        log.trade(`--- SCALP: ${market || 'N/A'} ---`);
+        log.trade(`BUY ${shares} shares @ ${buyPrice} ($${size.toFixed(2)})`);
+        log.trade(`SELL cible: ${shares} shares @ ${sellPrice} (+${priceDiff * 100}c)`);
+
+        // Re-vérifier l'orderbook juste avant d'exécuter
+        const freshBook = await this.poly.analyzeBookForScalp(tokenId);
+        const check = await this.llm.quickBookCheck(freshBook, market);
+        if (!check.ok) {
+            log.warn(`Scalp annulé (book changé): ${check.reason}`);
+            return;
+        }
+
+        // Ajuster le prix si le book a bougé
+        let finalBuyPrice = buyPrice;
+        let finalSellPrice = sellPrice;
+        if (freshBook && freshBook.bestBid !== buyPrice) {
+            finalBuyPrice = freshBook.bestBid;
+            finalSellPrice = +(freshBook.bestBid + CONFIG.SCALP_TICK).toFixed(2);
+            log.trade(`Prix ajusté: buy=${finalBuyPrice} sell=${finalSellPrice}`);
+        }
+
+        // Vérifier que le sell sera dans le spread
+        if (freshBook && finalSellPrice > freshBook.bestAsk) {
+            log.warn(`Sell price ${finalSellPrice} > bestAsk ${freshBook.bestAsk} - skip`);
+            return;
+        }
+
+        try {
+            // === ÉTAPE 1: BUY ===
+            const buyResult = await this.poly.placeOrder({
+                tokenId,
+                side: 'buy',
+                price: finalBuyPrice,
+                size: shares,
+            });
+
+            if (!buyResult) {
+                log.error('Buy échoué');
+                this.stats.failedScalps++;
+                return;
             }
-        } else {
-            if (existing && existing.side === 'buy') {
-                const remaining = existing.size - parseFloat(trade.size);
-                if (remaining <= 0) {
-                    this.state.openPositions.delete(key);
-                } else {
-                    this.state.openPositions.set(key, { ...existing, size: remaining });
-                }
-            } else {
-                this.state.openPositions.set(key, {
-                    side: 'sell',
-                    size: parseFloat(trade.size),
-                    avgPrice: parseFloat(trade.price),
+
+            const buyVolume = size;
+            this.state.dailyVolume += buyVolume;
+            this.state.dailyTrades.push({
+                type: 'scalp-buy',
+                market,
+                tokenId,
+                price: finalBuyPrice,
+                shares,
+                usd: size,
+                orderId: buyResult.id,
+                time: new Date().toISOString(),
+            });
+            this.stats.totalVolume += buyVolume;
+
+            log.trade(`BUY OK: ${buyResult.id} | Vol: +$${buyVolume.toFixed(2)}`);
+
+            // Petite pause pour laisser le buy se fill
+            await new Promise(r => setTimeout(r, 500));
+
+            // === ÉTAPE 2: SELL immédiat à +0.01 ===
+            const sellShares = shares;
+            const sellResult = await this.poly.placeOrder({
+                tokenId,
+                side: 'sell',
+                price: finalSellPrice,
+                size: sellShares,
+            });
+
+            if (!sellResult) {
+                log.error('Sell échoué - position ouverte!');
+                this.state.activeScalps.push({
+                    market,
+                    tokenId,
+                    buyPrice: finalBuyPrice,
+                    sellPrice: finalSellPrice,
+                    shares,
+                    buyOrderId: buyResult.id,
+                    time: new Date().toISOString(),
                 });
+                this.stats.failedScalps++;
+                return;
             }
+
+            const sellVolume = sellShares * finalSellPrice;
+            this.state.dailyVolume += sellVolume;
+            this.state.dailyTrades.push({
+                type: 'scalp-sell',
+                market,
+                tokenId,
+                price: finalSellPrice,
+                shares: sellShares,
+                usd: sellVolume,
+                orderId: sellResult.id,
+                time: new Date().toISOString(),
+            });
+            this.stats.totalVolume += sellVolume;
+
+            // Profit du scalp
+            const profit = (finalSellPrice - finalBuyPrice) * shares;
+            this.state.dailyProfit += profit;
+            this.state.dailyScalps++;
+            this.stats.completedScalps++;
+            this.stats.totalScalps++;
+
+            log.trade(`SELL OK: ${sellResult.id} | Vol: +$${sellVolume.toFixed(2)} | Profit: +$${profit.toFixed(4)}`);
+            log.trade(`Scalp complet! Volume total jour: $${this.state.dailyVolume.toFixed(2)}`);
+
+        } catch (error) {
+            log.error(`Erreur scalp:`, error.message);
+            this.stats.failedScalps++;
         }
     }
 
     /**
-     * Exécute un trade manuel (appelé depuis Telegram)
+     * Retente de vendre les positions ouvertes (scalps incomplets)
      */
-    async manualTrade({ tokenId, side, price, size, marketTitle }) {
-        this._checkDayReset();
-        return await this._executeTrade({
-            tokenId,
-            side,
-            price,
-            size,
-            marketTitle,
-            type: 'manual',
-        });
+    async retryFailedScalps() {
+        const active = [...this.state.activeScalps];
+        if (active.length === 0) return 'Aucun scalp en attente';
+
+        let retried = 0;
+        for (const scalp of active) {
+            try {
+                const result = await this.poly.placeOrder({
+                    tokenId: scalp.tokenId,
+                    side: 'sell',
+                    price: scalp.sellPrice,
+                    size: scalp.shares,
+                });
+                if (result) {
+                    this.state.activeScalps = this.state.activeScalps.filter(s => s.buyOrderId !== scalp.buyOrderId);
+                    retried++;
+                    log.trade(`Retry sell OK: ${scalp.market}`);
+                }
+            } catch (error) {
+                log.error(`Retry sell échoué: ${scalp.market} - ${error.message}`);
+            }
+        }
+        return `${retried}/${active.length} sells retentés`;
     }
 
-    /**
-     * Retourne le statut actuel du moteur
-     */
     getStatus() {
         return {
             isRunning: this.isRunning,
@@ -299,25 +327,23 @@ class TradingEngine {
             dailyVolume: this.state.dailyVolume,
             dailyTarget: CONFIG.DAILY_VOLUME_TARGET,
             dailyProgress: ((this.state.dailyVolume / CONFIG.DAILY_VOLUME_TARGET) * 100).toFixed(1),
-            dailyTradeCount: this.state.dailyTrades.length,
-            openPositions: this.state.openPositions.size,
+            dailyScalps: this.state.dailyScalps,
+            dailyProfit: this.state.dailyProfit,
+            activeScalps: this.state.activeScalps.length,
             totalCycles: this.state.totalCycles,
+            scalpTick: CONFIG.SCALP_TICK,
+            tradeSize: CONFIG.TRADE_SIZE_USD,
+            minVolume: CONFIG.MIN_MARKET_VOLUME,
             stats: { ...this.stats },
         };
     }
 
-    /**
-     * Retourne les trades du jour
-     */
     getDailyTrades() {
         return this.state.dailyTrades;
     }
 
-    /**
-     * Retourne les positions ouvertes
-     */
-    getOpenPositions() {
-        return Object.fromEntries(this.state.openPositions);
+    getActiveScalps() {
+        return this.state.activeScalps;
     }
 }
 

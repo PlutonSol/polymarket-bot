@@ -24,13 +24,19 @@ const CONFIG = {
     TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
     TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',
 
-    // Trading
-    DAILY_VOLUME_TARGET: parseFloat(process.env.DAILY_VOLUME_TARGET || '1000'),
-    MAX_TRADE_SIZE: parseFloat(process.env.MAX_TRADE_SIZE || '50'),
-    MIN_TRADE_SIZE: parseFloat(process.env.MIN_TRADE_SIZE || '5'),
-    MAX_OPEN_POSITIONS: parseInt(process.env.MAX_OPEN_POSITIONS || '10'),
-    TRADING_INTERVAL: parseInt(process.env.TRADING_INTERVAL || '60') * 1000,
-    MAX_SPREAD: parseFloat(process.env.MAX_SPREAD || '5'),
+    // Scalping parameters
+    MIN_MARKET_VOLUME: parseFloat(process.env.MIN_MARKET_VOLUME || '1000000'),  // 1M minimum
+    SCALP_TICK: parseFloat(process.env.SCALP_TICK || '0.01'),                   // +0.01 revente (1 tick = 1 cent)
+    TRADE_SIZE_USD: parseFloat(process.env.TRADE_SIZE_USD || '50'),              // Taille par scalp en USD
+    MAX_TRADE_SIZE: parseFloat(process.env.MAX_TRADE_SIZE || '200'),             // Taille max par scalp
+    MIN_TRADE_SIZE: parseFloat(process.env.MIN_TRADE_SIZE || '5'),               // Taille min par scalp
+    DAILY_VOLUME_TARGET: parseFloat(process.env.DAILY_VOLUME_TARGET || '5000'),  // Volume cible/jour
+    SCALP_INTERVAL: parseInt(process.env.SCALP_INTERVAL || '30') * 1000,         // Intervalle entre scalps (30s)
+    MAX_CONCURRENT_SCALPS: parseInt(process.env.MAX_CONCURRENT_SCALPS || '3'),   // Scalps simultanés max
+    SCALP_TIMEOUT: parseInt(process.env.SCALP_TIMEOUT || '60') * 1000,           // Timeout pour sell après buy (60s)
+    MAX_SPREAD_CENTS: parseFloat(process.env.MAX_SPREAD_CENTS || '3'),           // Spread max acceptable en cents
+    MIN_BOOK_DEPTH_USD: parseFloat(process.env.MIN_BOOK_DEPTH_USD || '500'),     // Liquidité min dans le book
+
     DRY_RUN: process.env.DRY_RUN !== 'false',
 };
 
