@@ -308,6 +308,49 @@ class PolymarketClient {
             return [];
         }
     }
+
+    // ========== WALLET BALANCE ==========
+
+    /**
+     * Récupère le solde USDC du wallet sur Polygon.
+     * En DRY_RUN retourne une balance simulée.
+     */
+    async getWalletBalance() {
+        if (CONFIG.DRY_RUN) {
+            return this._dryRunBalance;
+        }
+
+        try {
+            // USDC sur Polygon
+            const USDC_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+            const ERC20_ABI = ['function balanceOf(address) view returns (uint256)'];
+
+            const { ethers } = require('ethers');
+            const provider = new ethers.providers.JsonRpcProvider('https://polygon-rpc.com');
+            const usdc = new ethers.Contract(USDC_ADDRESS, ERC20_ABI, provider);
+            const raw = await usdc.balanceOf(CONFIG.WALLET_ADDRESS);
+            // USDC a 6 decimales
+            const balance = parseFloat(ethers.utils.formatUnits(raw, 6));
+            log.info(`Wallet balance: $${balance.toFixed(2)} USDC`);
+            return balance;
+        } catch (error) {
+            log.error('Erreur balance:', error.message);
+            return 0;
+        }
+    }
+
+    /**
+     * Calcule la taille max d'un trade basée sur 20% du wallet
+     */
+    async getMaxTradeSize() {
+        const balance = await this.getWalletBalance();
+        const maxFromWallet = balance * CONFIG.MAX_WALLET_EXPOSURE;
+        const maxSize = Math.min(maxFromWallet, CONFIG.MAX_TRADE_SIZE);
+        return Math.max(maxSize, 0); // jamais négatif
+    }
 }
+
+// Balance simulée en DRY_RUN
+PolymarketClient.prototype._dryRunBalance = 1000;
 
 module.exports = PolymarketClient;

@@ -89,18 +89,20 @@ class LLMAnalyzer {
         const systemPrompt = `Tu es un algorithme de scalping sur les marchés de prédiction Polymarket.
 
 STRATÉGIE: Acheter au best bid et revendre immédiatement ${CONFIG.SCALP_TICK * 100} cent(s) plus cher.
+On cible les marchés ULTRA-LIQUIDES avec un spread très serré (<= ${CONFIG.MAX_SPREAD_CENTS}c).
 
 CRITÈRES DE SÉLECTION (par ordre de priorité):
-1. SPREAD >= ${CONFIG.SCALP_TICK * 100} cent(s): Le spread doit être assez large pour que notre sell à +${CONFIG.SCALP_TICK * 100}c soit dans le spread ou au ask
+1. SPREAD <= ${CONFIG.MAX_SPREAD_CENTS} cent(s): On veut des marchés très liquides avec spread serré
 2. LIQUIDITÉ: La profondeur du book doit être >= $${CONFIG.MIN_BOOK_DEPTH_USD} des deux côtés
-3. VOLUME 24H élevé: Plus de volume = plus de chances d'être fill
+3. VOLUME 24H élevé: Plus de volume = plus de chances d'être fill rapidement
 4. Choisir le token (Yes ou No) qui a le MEILLEUR orderbook pour scalper
-5. Ne JAMAIS recommander un marché avec spread < ${CONFIG.SCALP_TICK * 100} cent(s)
+5. Ne JAMAIS recommander un marché avec spread > ${CONFIG.MAX_SPREAD_CENTS} cent(s)
+6. Privilégier les marchés où le bestBidSize est élevé (plus de liquidité au bid)
 
 Pour chaque marché, choisis le meilleur token à scalper (Yes ou No) selon:
-- Quel token a le spread le plus favorable
+- Quel token a le spread le plus serré (mais > 0)
 - Quel token a la meilleure profondeur de liquidité
-- Le prix d'entrée optimal (au best bid ou légèrement au-dessus)
+- Le prix d'entrée optimal (au best bid)
 
 Réponds UNIQUEMENT en JSON:
 {
@@ -191,8 +193,11 @@ Sélectionne les meilleurs marchés pour scalper maintenant.`;
     async quickBookCheck(bookAnalysis, marketTitle) {
         // Pas besoin du LLM pour ça - logique pure
         if (!bookAnalysis) return { ok: false, reason: 'Pas de book' };
-        if (bookAnalysis.spreadCents < CONFIG.SCALP_TICK * 100) {
-            return { ok: false, reason: `Spread trop serré: ${bookAnalysis.spreadCents}c` };
+        if (bookAnalysis.spreadCents <= 0) {
+            return { ok: false, reason: `Spread nul` };
+        }
+        if (bookAnalysis.spreadCents > CONFIG.MAX_SPREAD_CENTS) {
+            return { ok: false, reason: `Spread trop large: ${bookAnalysis.spreadCents}c > ${CONFIG.MAX_SPREAD_CENTS}c` };
         }
         if (bookAnalysis.bidDepthUsd < CONFIG.MIN_BOOK_DEPTH_USD) {
             return { ok: false, reason: `Bid depth faible: $${bookAnalysis.bidDepthUsd.toFixed(0)}` };

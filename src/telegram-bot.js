@@ -18,14 +18,15 @@ class TelegramController {
         this._setupCommands();
         log.info('Telegram initialisé');
 
-        await this.send(`🤖 *Polymarket Scalping Bot v7.0*
+        await this.send(`🤖 *Polymarket Scalping Bot v7.1*
 
 🧠 *LLM:* ${CONFIG.LLM_PROVIDER} (${CONFIG.LLM_MODEL})
 💰 *Mode:* ${CONFIG.DRY_RUN ? '🧪 DRY RUN' : '🔴 LIVE'}
-📊 *Stratégie:* Buy + Sell +${CONFIG.SCALP_TICK * 100}c
+📊 *Stratégie:* Buy @ bid → Sell @ bid+${CONFIG.SCALP_TICK * 100}c
 🎯 *Volume cible:* $${CONFIG.DAILY_VOLUME_TARGET}/jour
-💵 *Taille scalp:* $${CONFIG.TRADE_SIZE_USD}
-📈 *Min volume marché:* $${(CONFIG.MIN_MARKET_VOLUME / 1e6).toFixed(0)}M
+💳 *Max par trade:* 20% du wallet
+📈 *Marchés:* >= $${(CONFIG.MIN_MARKET_VOLUME / 1e6).toFixed(0)}M vol, spread <= ${CONFIG.MAX_SPREAD_CENTS}c
+⏱ *Cycle:* ${CONFIG.SCALP_INTERVAL / 1000}s
 
 📋 *Commandes:*
 /start\\_scalp - Démarrer le scalping
@@ -66,7 +67,7 @@ class TelegramController {
 
         this.bot.onText(/\/status/, async (msg) => {
             if (!this._auth(msg)) return;
-            const s = this.engine.getStatus();
+            const s = await this.engine.getStatus();
             const bar = this._bar(parseFloat(s.dailyProgress));
             await this.send(`📊 *Status Scalping Bot*
 
@@ -78,10 +79,15 @@ class TelegramController {
 ${bar} ${s.dailyProgress}%
 $${s.dailyVolume.toFixed(0)} / $${s.dailyTarget}
 
+💳 *Wallet:*
+• Balance: $${s.walletBalance.toFixed(2)} USDC
+• Max par trade (${s.walletExposure}%): $${s.maxTradeSize.toFixed(2)}
+
 ⚡ *Scalping:*
 • Tick: +${s.scalpTick * 100}c (buy → sell +${s.scalpTick * 100}c)
-• Taille: $${s.tradeSize}
+• Max spread: ${s.maxSpread}c
 • Min volume marché: $${(s.minVolume / 1e6).toFixed(0)}M
+• Intervalle: ${CONFIG.SCALP_INTERVAL / 1000}s
 • Scalps complets: ${s.dailyScalps}
 • Profit théorique: $${s.dailyProfit.toFixed(4)}
 • Scalps actifs: ${s.activeScalps}
@@ -143,10 +149,10 @@ $${s.dailyVolume.toFixed(0)} / $${s.dailyTarget}
                     return await this.send('❌ Aucun orderbook dispo');
                 }
 
-                // Pre-filtrer
+                // Pre-filtrer: spread <= MAX_SPREAD_CENTS (0.2c)
                 const viable = enriched.filter(m => {
-                    const yesOk = m.yesBook && m.yesBook.spreadCents >= CONFIG.SCALP_TICK * 100;
-                    const noOk = m.noBook && m.noBook.spreadCents >= CONFIG.SCALP_TICK * 100;
+                    const yesOk = m.yesBook && m.yesBook.spreadCents > 0 && m.yesBook.spreadCents <= CONFIG.MAX_SPREAD_CENTS;
+                    const noOk = m.noBook && m.noBook.spreadCents > 0 && m.noBook.spreadCents <= CONFIG.MAX_SPREAD_CENTS;
                     return yesOk || noOk;
                 });
 
@@ -159,13 +165,13 @@ $${s.dailyVolume.toFixed(0)} / $${s.dailyTarget}
 
                     if (m.yesBook) {
                         const y = m.yesBook;
-                        const tag = y.spreadCents >= CONFIG.SCALP_TICK * 100 ? '✅' : '❌';
+                        const tag = y.spreadCents > 0 && y.spreadCents <= CONFIG.MAX_SPREAD_CENTS ? '✅' : '❌';
                         text += `   YES: bid=${y.bestBid} ask=${y.bestAsk} spread=${y.spreadCents}c ${tag}\n`;
                         text += `   Depth: bid=$${y.bidDepthUsd.toFixed(0)} ask=$${y.askDepthUsd.toFixed(0)}\n`;
                     }
                     if (m.noBook) {
                         const n = m.noBook;
-                        const tag = n.spreadCents >= CONFIG.SCALP_TICK * 100 ? '✅' : '❌';
+                        const tag = n.spreadCents > 0 && n.spreadCents <= CONFIG.MAX_SPREAD_CENTS ? '✅' : '❌';
                         text += `   NO:  bid=${n.bestBid} ask=${n.bestAsk} spread=${n.spreadCents}c ${tag}\n`;
                         text += `   Depth: bid=$${n.bidDepthUsd.toFixed(0)} ask=$${n.askDepthUsd.toFixed(0)}\n`;
                     }
@@ -173,7 +179,7 @@ $${s.dailyVolume.toFixed(0)} / $${s.dailyTarget}
                 }
 
                 if (viable.length === 0) {
-                    text += `\n⚠️ _Aucun marché avec spread >= ${CONFIG.SCALP_TICK * 100}c_`;
+                    text += `\n⚠️ _Aucun marché avec spread <= ${CONFIG.MAX_SPREAD_CENTS}c_`;
                     await this.send(text);
                     return;
                 }
@@ -245,13 +251,14 @@ $${s.dailyVolume.toFixed(0)} / $${s.dailyTarget}
 
         this.bot.onText(/\/volume/, async (msg) => {
             if (!this._auth(msg)) return;
-            const s = this.engine.getStatus();
+            const s = await this.engine.getStatus();
             const bar = this._bar(parseFloat(s.dailyProgress));
             await this.send(`💰 *Volume du jour*
 
 ${bar}
 $${s.dailyVolume.toFixed(0)} / $${s.dailyTarget} (${s.dailyProgress}%)
 
+💳 Wallet: $${s.walletBalance.toFixed(2)} | Max trade: $${s.maxTradeSize.toFixed(2)} (${s.walletExposure}%)
 ⚡ ${s.dailyScalps} scalps complets
 💵 Profit: $${s.dailyProfit.toFixed(4)}`);
         });

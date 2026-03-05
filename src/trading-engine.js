@@ -3,7 +3,8 @@ const log = require('./logger');
 
 /**
  * Moteur de scalping - Achète au best bid et revend immédiatement +0.01
- * Cible uniquement les marchés avec volume >= 1M
+ * Cible uniquement les marchés avec volume >= 1M et spread < 0.2c
+ * Max 20% du wallet engagé par trade
  */
 class TradingEngine {
     constructor(polyClient, llmAnalyzer) {
@@ -114,19 +115,20 @@ class TradingEngine {
             return;
         }
 
-        // Pre-filtrer: garder seulement ceux avec un spread >= 1 cent sur au moins un token
+        // Pre-filtrer: garder seulement ceux avec spread <= MAX_SPREAD_CENTS (0.2c)
+        // On veut des marchés ultra-liquides avec un spread très serré
         const viable = enriched.filter(m => {
-            const yesOk = m.yesBook && m.yesBook.spreadCents >= CONFIG.SCALP_TICK * 100;
-            const noOk = m.noBook && m.noBook.spreadCents >= CONFIG.SCALP_TICK * 100;
+            const yesOk = m.yesBook && m.yesBook.spreadCents > 0 && m.yesBook.spreadCents <= CONFIG.MAX_SPREAD_CENTS;
+            const noOk = m.noBook && m.noBook.spreadCents > 0 && m.noBook.spreadCents <= CONFIG.MAX_SPREAD_CENTS;
             return yesOk || noOk;
         });
 
         if (viable.length === 0) {
-            log.info('Aucun marché avec spread suffisant pour scalper');
+            log.info(`Aucun marché avec spread <= ${CONFIG.MAX_SPREAD_CENTS}c`);
             return;
         }
 
-        log.info(`${viable.length} marchés avec spread >= ${CONFIG.SCALP_TICK * 100}c`);
+        log.info(`${viable.length} marchés avec spread <= ${CONFIG.MAX_SPREAD_CENTS}c`);
 
         // 3. LLM sélectionne les meilleurs targets
         this.stats.llmCalls++;
@@ -158,6 +160,7 @@ class TradingEngine {
 
     /**
      * Exécute un scalp complet: BUY au bestBid puis SELL à bestBid + 0.01
+     * La taille est limitée à 20% du wallet
      */
     async _executeScalp(target) {
         const { tokenId, buyPrice, sellPrice, sizeUsd, market } = target;
@@ -174,8 +177,18 @@ class TradingEngine {
             return;
         }
 
-        const size = Math.min(Math.max(sizeUsd || CONFIG.TRADE_SIZE_USD, CONFIG.MIN_TRADE_SIZE), CONFIG.MAX_TRADE_SIZE);
+        // Calculer la taille max basée sur 20% du wallet
+        const maxFromWallet = await this.poly.getMaxTradeSize();
+        if (maxFromWallet < CONFIG.MIN_TRADE_SIZE) {
+            log.warn(`Wallet trop faible: max trade=$${maxFromWallet.toFixed(2)} (20% du wallet)`);
+            return;
+        }
+
+        const desiredSize = sizeUsd || CONFIG.TRADE_SIZE_USD;
+        const size = Math.min(Math.max(desiredSize, CONFIG.MIN_TRADE_SIZE), maxFromWallet);
         const shares = +(size / buyPrice).toFixed(2);
+
+        log.trade(`Wallet 20% cap: $${maxFromWallet.toFixed(2)} | Taille effective: $${size.toFixed(2)}`);
 
         log.trade(`--- SCALP: ${market || 'N/A'} ---`);
         log.trade(`BUY ${shares} shares @ ${buyPrice} ($${size.toFixed(2)})`);
@@ -198,9 +211,15 @@ class TradingEngine {
             log.trade(`Prix ajusté: buy=${finalBuyPrice} sell=${finalSellPrice}`);
         }
 
-        // Vérifier que le sell sera dans le spread
+        // Vérifier que le sell sera dans le spread ou au ask
         if (freshBook && finalSellPrice > freshBook.bestAsk) {
-            log.warn(`Sell price ${finalSellPrice} > bestAsk ${freshBook.bestAsk} - skip`);
+            log.warn(`Sell ${finalSellPrice} > bestAsk ${freshBook.bestAsk} - skip`);
+            return;
+        }
+
+        // Vérifier que le spread est toujours <= MAX_SPREAD_CENTS
+        if (freshBook && freshBook.spreadCents > CONFIG.MAX_SPREAD_CENTS) {
+            log.warn(`Spread ${freshBook.spreadCents}c > max ${CONFIG.MAX_SPREAD_CENTS}c - skip`);
             return;
         }
 
@@ -320,7 +339,9 @@ class TradingEngine {
         return `${retried}/${active.length} sells retentés`;
     }
 
-    getStatus() {
+    async getStatus() {
+        const walletBalance = await this.poly.getWalletBalance();
+        const maxTradeSize = walletBalance * CONFIG.MAX_WALLET_EXPOSURE;
         return {
             isRunning: this.isRunning,
             mode: CONFIG.DRY_RUN ? 'DRY RUN' : 'LIVE',
@@ -334,6 +355,10 @@ class TradingEngine {
             scalpTick: CONFIG.SCALP_TICK,
             tradeSize: CONFIG.TRADE_SIZE_USD,
             minVolume: CONFIG.MIN_MARKET_VOLUME,
+            maxSpread: CONFIG.MAX_SPREAD_CENTS,
+            walletBalance,
+            maxTradeSize,
+            walletExposure: CONFIG.MAX_WALLET_EXPOSURE * 100,
             stats: { ...this.stats },
         };
     }
