@@ -32,9 +32,12 @@ class TelegramController {
     }
 
     _auth(msg) {
-        const authorized = msg.chat.id.toString() === CONFIG.TELEGRAM_CHAT_ID;
+        const chatOk = msg.chat.id.toString() === CONFIG.TELEGRAM_CHAT_ID;
+        // Vérifier aussi l'ID utilisateur si configuré (protection groupe)
+        const userOk = !CONFIG.TELEGRAM_USER_ID || msg.from?.id?.toString() === CONFIG.TELEGRAM_USER_ID;
+        const authorized = chatOk && userOk;
         if (!authorized) {
-            log.warn(`Accès non autorisé: chat_id=${msg.chat.id} user=${msg.from?.username || 'unknown'}`);
+            log.warn(`Accès non autorisé: chat_id=${msg.chat.id} user_id=${msg.from?.id} username=${msg.from?.username || 'unknown'}`);
         }
         return authorized;
     }

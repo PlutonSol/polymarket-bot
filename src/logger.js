@@ -16,6 +16,9 @@ const SECRET_PATTERNS = [
     /sk-[a-zA-Z0-9]{20,}/g,                  // OpenAI API keys
     /sk-ant-[a-zA-Z0-9-]{20,}/g,             // Anthropic API keys
     /\b\d{8,}:[A-Za-z0-9_-]{30,}\b/g,        // Telegram bot tokens
+    /"key"\s*:\s*"[^"]+"/g,                   // API key in JSON objects
+    /"secret"\s*:\s*"[^"]+"/g,                // API secret in JSON objects
+    /"passphrase"\s*:\s*"[^"]+"/g,            // API passphrase in JSON objects
 ];
 
 function sanitize(str) {

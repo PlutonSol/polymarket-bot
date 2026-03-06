@@ -43,7 +43,17 @@ async function main() {
     const shutdown = async (signal) => {
         log.info(`${signal} - arrêt...`);
         tradingEngine.stop();
-        await telegram.send('Bot arrêté (signal système)');
+
+        // Annuler tous les ordres GTC ouverts avant de quitter
+        try {
+            log.info('Annulation des ordres ouverts...');
+            await polyClient.cancelAllOrders();
+            log.info('Ordres ouverts annulés');
+        } catch (e) {
+            log.error('Erreur annulation ordres au shutdown:', e.message);
+        }
+
+        await telegram.send('Bot arrêté (signal système) - ordres annulés');
         process.exit(0);
     };
 

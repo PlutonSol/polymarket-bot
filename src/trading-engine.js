@@ -12,6 +12,7 @@ class TradingEngine {
         this.llm = llmAnalyzer;
         this.isRunning = false;
         this.loopTimeout = null;
+        this._scalpsLock = false; // Verrou pour éviter les race conditions sur activeScalps
 
         // État
         this.state = {
@@ -54,7 +55,7 @@ class TradingEngine {
     async _runLoop() {
         while (this.isRunning) {
             try {
-                this._checkDayReset();
+                await this._checkDayReset();
                 await this._executeScalpCycle();
                 this.state.totalCycles++;
             } catch (error) {
@@ -69,7 +70,18 @@ class TradingEngine {
         }
     }
 
-    _checkDayReset() {
+    async _acquireScalpsLock() {
+        while (this._scalpsLock) {
+            await new Promise(r => setTimeout(r, 10));
+        }
+        this._scalpsLock = true;
+    }
+
+    _releaseScalpsLock() {
+        this._scalpsLock = false;
+    }
+
+    async _checkDayReset() {
         const today = new Date().toDateString();
         if (today !== this.state.lastResetDate) {
             log.info('Reset journalier');
@@ -80,14 +92,19 @@ class TradingEngine {
             this.state.lastResetDate = today;
         }
         // Nettoyer les activeScalps périmés (> SCALP_TIMEOUT)
-        const now = Date.now();
-        const before = this.state.activeScalps.length;
-        this.state.activeScalps = this.state.activeScalps.filter(s => {
-            const age = now - new Date(s.time).getTime();
-            return age < CONFIG.SCALP_TIMEOUT;
-        });
-        const cleaned = before - this.state.activeScalps.length;
-        if (cleaned > 0) log.warn(`${cleaned} scalps périmés nettoyés`);
+        await this._acquireScalpsLock();
+        try {
+            const now = Date.now();
+            const before = this.state.activeScalps.length;
+            this.state.activeScalps = this.state.activeScalps.filter(s => {
+                const age = now - new Date(s.time).getTime();
+                return age < CONFIG.SCALP_TIMEOUT;
+            });
+            const cleaned = before - this.state.activeScalps.length;
+            if (cleaned > 0) log.warn(`${cleaned} scalps périmés nettoyés`);
+        } finally {
+            this._releaseScalpsLock();
+        }
     }
 
     /**
@@ -98,6 +115,13 @@ class TradingEngine {
      * 4. Exécuter les scalps (buy + sell immédiat à +0.01)
      */
     async _executeScalpCycle() {
+        // Stop-loss global: arrêter si les pertes dépassent le seuil
+        if (this.state.dailyProfit < -CONFIG.MAX_DAILY_LOSS) {
+            log.error(`STOP-LOSS: perte journalière $${Math.abs(this.state.dailyProfit).toFixed(2)} > max $${CONFIG.MAX_DAILY_LOSS}`);
+            this.stop();
+            return;
+        }
+
         if (this.state.dailyVolume >= CONFIG.DAILY_VOLUME_TARGET) {
             log.info(`Volume cible atteint: $${this.state.dailyVolume.toFixed(0)} / $${CONFIG.DAILY_VOLUME_TARGET}`);
             return;
@@ -151,13 +175,25 @@ class TradingEngine {
 
         log.info(`${targets.length} targets sélectionnés par LLM`);
 
-        // 4. Exécuter les scalps
-        const maxScalps = Math.min(targets.length, CONFIG.MAX_CONCURRENT_SCALPS);
+        // 4. Valider les targets LLM contre les données réelles (anti-injection)
+        const validatedTargets = this._validateLLMTargets(targets, viable);
+
+        if (validatedTargets.length === 0) {
+            log.warn('Aucun target LLM validé contre les données réelles');
+            return;
+        }
+
+        if (validatedTargets.length < targets.length) {
+            log.warn(`${targets.length - validatedTargets.length} targets LLM rejetés (tokenId/prix invalides)`);
+        }
+
+        // 5. Exécuter les scalps
+        const maxScalps = Math.min(validatedTargets.length, CONFIG.MAX_CONCURRENT_SCALPS);
         for (let i = 0; i < maxScalps; i++) {
             if (!this.isRunning) break;
             if (this.state.dailyVolume >= CONFIG.DAILY_VOLUME_TARGET) break;
 
-            const target = targets[i];
+            const target = validatedTargets[i];
             await this._executeScalp(target);
 
             // Petite pause entre scalps
@@ -165,6 +201,53 @@ class TradingEngine {
                 await new Promise(r => setTimeout(r, 1500));
             }
         }
+    }
+
+    /**
+     * Valide que les targets du LLM correspondent aux données réelles des marchés.
+     * Empêche le LLM de retourner des tokenIds ou prix arbitraires (injection).
+     */
+    _validateLLMTargets(targets, enrichedMarkets) {
+        // Construire un set de tous les tokenIds et books connus
+        const knownTokens = new Map();
+        for (const m of enrichedMarkets) {
+            if (m.yesTokenId && m.yesBook) {
+                knownTokens.set(m.yesTokenId, { book: m.yesBook, market: m.question });
+            }
+            if (m.noTokenId && m.noBook) {
+                knownTokens.set(m.noTokenId, { book: m.noBook, market: m.question });
+            }
+        }
+
+        return targets.filter(t => {
+            // 1. Le tokenId doit exister dans nos données
+            if (!knownTokens.has(t.tokenId)) {
+                log.warn(`LLM target rejeté: tokenId ${t.tokenId} inconnu`);
+                return false;
+            }
+
+            const { book } = knownTokens.get(t.tokenId);
+
+            // 2. Le buyPrice doit être proche du bestBid réel (tolérance 2 cents)
+            if (Math.abs(t.buyPrice - book.bestBid) > 0.02) {
+                log.warn(`LLM target rejeté: buyPrice ${t.buyPrice} trop loin du bestBid réel ${book.bestBid}`);
+                return false;
+            }
+
+            // 3. Le prix doit être entre 0.01 et 0.99 (marché de prédiction)
+            if (t.buyPrice < 0.01 || t.buyPrice > 0.99 || t.sellPrice < 0.01 || t.sellPrice > 0.99) {
+                log.warn(`LLM target rejeté: prix hors bornes buy=${t.buyPrice} sell=${t.sellPrice}`);
+                return false;
+            }
+
+            // 4. La taille ne doit pas dépasser MAX_TRADE_SIZE
+            if (t.sizeUsd && t.sizeUsd > CONFIG.MAX_TRADE_SIZE) {
+                log.warn(`LLM target corrigé: sizeUsd ${t.sizeUsd} > max ${CONFIG.MAX_TRADE_SIZE}`);
+                t.sizeUsd = CONFIG.MAX_TRADE_SIZE;
+            }
+
+            return true;
+        });
     }
 
     /**
@@ -301,15 +384,20 @@ class TradingEngine {
 
             if (!sellResult) {
                 log.error('Sell échoué - position ouverte!');
-                this.state.activeScalps.push({
-                    market,
-                    tokenId,
-                    buyPrice: finalBuyPrice,
-                    sellPrice: finalSellPrice,
-                    shares,
-                    buyOrderId: buyResult.id,
-                    time: new Date().toISOString(),
-                });
+                await this._acquireScalpsLock();
+                try {
+                    this.state.activeScalps.push({
+                        market,
+                        tokenId,
+                        buyPrice: finalBuyPrice,
+                        sellPrice: finalSellPrice,
+                        shares,
+                        buyOrderId: buyResult.id,
+                        time: new Date().toISOString(),
+                    });
+                } finally {
+                    this._releaseScalpsLock();
+                }
                 this.stats.failedScalps++;
                 return;
             }

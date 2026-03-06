@@ -1,9 +1,31 @@
-const { CONFIG } = require('./config');
+const { CONFIG, getPrivateKey, clearPrivateKey } = require('./config');
 const log = require('./logger');
 
 let marketsCache = [];
 let marketsCacheTime = 0;
 const CACHE_TTL = 2 * 60 * 1000; // 2 min
+
+// Rate limiter simple: max N appels par fenêtre de temps
+class RateLimiter {
+    constructor(maxCalls, windowMs) {
+        this.maxCalls = maxCalls;
+        this.windowMs = windowMs;
+        this.calls = [];
+    }
+    async wait() {
+        const now = Date.now();
+        this.calls = this.calls.filter(t => now - t < this.windowMs);
+        if (this.calls.length >= this.maxCalls) {
+            const waitTime = this.calls[0] + this.windowMs - now;
+            await new Promise(r => setTimeout(r, waitTime));
+        }
+        this.calls.push(Date.now());
+    }
+}
+
+// Limites : 10 appels/s pour CLOB, 5/s pour Gamma, 3/s pour LLM
+const clobLimiter = new RateLimiter(10, 1000);
+const gammaLimiter = new RateLimiter(5, 1000);
 
 /**
  * Client Polymarket - Optimisé pour le scalping sur marchés à gros volume
@@ -29,7 +51,9 @@ class PolymarketClient {
             const { SignatureType } = require('@polymarket/order-utils');
             const { ethers } = require('ethers');
 
-            const wallet = new ethers.Wallet(CONFIG.PRIVATE_KEY);
+            const privateKey = getPrivateKey();
+            if (!privateKey) throw new Error('PRIVATE_KEY manquante ou placeholder non remplacé');
+            const wallet = new ethers.Wallet(privateKey);
             const signerAddress = await wallet.getAddress();
             log.info(`Signer (EOA): ${signerAddress}`);
 
@@ -105,6 +129,10 @@ class PolymarketClient {
             this.initialized = true;
             log.info('Client CLOB initialisé (POLY_PROXY mode)');
 
+            // Nettoyer la private key de l'environnement - elle est maintenant dans le wallet signer du ClobClient
+            clearPrivateKey();
+            log.info('Private key effacée de l\'environnement');
+
             // Étape 4: Vérifier l'allowance USDC
             await this._checkAndSetAllowance();
 
@@ -156,6 +184,7 @@ class PolymarketClient {
 
     async getHighVolumeMarkets(limit = 100) {
         try {
+            await gammaLimiter.wait();
             const params = new URLSearchParams({
                 limit: limit.toString(),
                 active: 'true',
@@ -199,6 +228,7 @@ class PolymarketClient {
 
     async getOrderBook(tokenId) {
         try {
+            await clobLimiter.wait();
             const res = await fetch(`${CONFIG.CLOB_HOST}/book?token_id=${tokenId}`);
             if (!res.ok) throw new Error(`Orderbook API ${res.status}`);
             return await res.json();
@@ -217,23 +247,35 @@ class PolymarketClient {
 
         if (bids.length === 0 || asks.length === 0) return null;
 
-        bids.sort((a, b) => b.price - a.price);
-        asks.sort((a, b) => a.price - b.price);
+        // Filtrer les entrées invalides (NaN, négatif, hors bornes marché de prédiction)
+        const validBids = bids.filter(o => Number.isFinite(o.price) && Number.isFinite(o.size) && o.price > 0 && o.price < 1 && o.size > 0);
+        const validAsks = asks.filter(o => Number.isFinite(o.price) && Number.isFinite(o.size) && o.price > 0 && o.price < 1 && o.size > 0);
 
-        const bestBid = bids[0].price;
-        const bestAsk = asks[0].price;
+        if (validBids.length === 0 || validAsks.length === 0) return null;
+
+        validBids.sort((a, b) => b.price - a.price);
+        validAsks.sort((a, b) => a.price - b.price);
+
+        const bestBid = validBids[0].price;
+        const bestAsk = validAsks[0].price;
+
+        // Validation de cohérence: bestBid doit être < bestAsk
+        if (bestBid >= bestAsk) {
+            log.warn(`Orderbook incohérent pour ${tokenId}: bestBid=${bestBid} >= bestAsk=${bestAsk}`);
+            return null;
+        }
         const spreadCents = Math.round((bestAsk - bestBid) * 100);
 
-        const bidDepthUsd = bids.slice(0, 5).reduce((s, o) => s + o.price * o.size, 0);
-        const askDepthUsd = asks.slice(0, 5).reduce((s, o) => s + o.price * o.size, 0);
+        const bidDepthUsd = validBids.slice(0, 5).reduce((s, o) => s + o.price * o.size, 0);
+        const askDepthUsd = validAsks.slice(0, 5).reduce((s, o) => s + o.price * o.size, 0);
 
-        const bestBidSize = bids[0].size;
-        const bestAskSize = asks[0].size;
+        const bestBidSize = validBids[0].size;
+        const bestAskSize = validAsks[0].size;
 
         const sellPrice = +(bestBid + CONFIG.SCALP_TICK).toFixed(2);
         const canSellAtTick = sellPrice <= bestAsk;
 
-        const askVolumeAtSellPrice = asks
+        const askVolumeAtSellPrice = validAsks
             .filter(o => o.price <= sellPrice)
             .reduce((s, o) => s + o.size, 0);
 
@@ -248,8 +290,8 @@ class PolymarketClient {
             sellPrice,
             canSellAtTick,
             askVolumeAtSellPrice,
-            bidsLevels: bids.length,
-            asksLevels: asks.length,
+            bidsLevels: validBids.length,
+            asksLevels: validAsks.length,
         };
     }
 
@@ -304,7 +346,14 @@ class PolymarketClient {
         if (!this.clobClient) throw new Error('Client CLOB non initialisé');
 
         try {
+            await clobLimiter.wait();
             const { Side, OrderType: OT } = require('@polymarket/clob-client');
+
+            // Nonce unique pour éviter les replay attacks
+            // Expiration à 5 minutes pour éviter les ordres orphelins
+            const ORDER_EXPIRY_MS = 5 * 60 * 1000;
+            const nonce = Date.now().toString();
+            const expiration = Math.floor((Date.now() + ORDER_EXPIRY_MS) / 1000);
 
             const orderPayload = {
                 tokenID: tokenId,
@@ -312,8 +361,8 @@ class PolymarketClient {
                 side: side === 'buy' ? Side.BUY : Side.SELL,
                 size,
                 feeRateBps: 0,
-                nonce: 0,
-                expiration: 0,
+                nonce,
+                expiration,
             };
 
             const signedOrder = await this.clobClient.createOrder(orderPayload);

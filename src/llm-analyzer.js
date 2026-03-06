@@ -1,6 +1,21 @@
 const { CONFIG } = require('./config');
 const log = require('./logger');
 
+// Rate limiter pour les appels LLM (max 3/min pour éviter les coûts explosifs)
+let llmCallTimestamps = [];
+const LLM_MAX_CALLS_PER_MIN = 10;
+
+async function llmRateLimit() {
+    const now = Date.now();
+    llmCallTimestamps = llmCallTimestamps.filter(t => now - t < 60000);
+    if (llmCallTimestamps.length >= LLM_MAX_CALLS_PER_MIN) {
+        const waitTime = llmCallTimestamps[0] + 60000 - now;
+        log.warn(`LLM rate limit: attente ${(waitTime / 1000).toFixed(1)}s`);
+        await new Promise(r => setTimeout(r, waitTime));
+    }
+    llmCallTimestamps.push(Date.now());
+}
+
 /**
  * LLM Analyzer - Sélectionne les meilleurs marchés pour le scalping
  * et optimise les paramètres (prix d'entrée, taille, token Yes/No)
@@ -12,6 +27,7 @@ class LLMAnalyzer {
 
     async callLLM(systemPrompt, userPrompt, { temperature = 0.2, maxTokens = 2000 } = {}) {
         try {
+            await llmRateLimit();
             if (this.provider === 'anthropic') {
                 return await this._callAnthropic(systemPrompt, userPrompt, temperature, maxTokens);
             }
