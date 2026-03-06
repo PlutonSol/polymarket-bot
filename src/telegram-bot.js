@@ -15,7 +15,23 @@ class TelegramController {
     }
 
     async initialize() {
-        this.bot = new TelegramBot(CONFIG.TELEGRAM_BOT_TOKEN, { polling: true });
+        this.bot = new TelegramBot(CONFIG.TELEGRAM_BOT_TOKEN, {
+            polling: {
+                autoStart: true,
+                params: { timeout: 30 },
+            },
+        });
+
+        // Gérer les erreurs de polling avec backoff pour éviter le flood de logs
+        this._pollingErrors = 0;
+        this.bot.on('polling_error', (error) => {
+            this._pollingErrors++;
+            // Log seulement les premières erreurs, puis 1 sur 100
+            if (this._pollingErrors <= 3 || this._pollingErrors % 100 === 0) {
+                log.error(`Telegram polling error (${this._pollingErrors}x): ${error.message}`);
+            }
+        });
+
         this._setupCommands();
         this._scheduleDailyRecap();
         log.info('Telegram initialisé');
