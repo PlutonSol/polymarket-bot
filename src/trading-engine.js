@@ -263,11 +263,35 @@ class TradingEngine {
 
             log.trade(`BUY OK: ${buyResult.id} | Vol: +$${buyVolume.toFixed(2)}`);
 
-            // Petite pause pour laisser le buy se fill
-            await new Promise(r => setTimeout(r, 500));
+            // === Vérification du fill avant de vendre ===
+            // Attendre que le buy soit rempli (max 10s, polling toutes les 1s)
+            const fillResult = await this.poly.waitForFill(buyResult.id, 10000, 1000);
 
-            // === ÉTAPE 2: SELL immédiat à +0.01 ===
-            const sellShares = shares;
+            if (!fillResult.filled) {
+                // Buy non rempli -> annuler et abandonner
+                log.warn(`Buy non rempli après 10s (status: ${fillResult.status}) - annulation`);
+                try {
+                    await this.poly.cancelOrder(buyResult.id);
+                    log.trade('Buy annulé: ' + buyResult.id);
+                } catch (cancelErr) {
+                    log.error('Erreur annulation buy:', cancelErr.message);
+                }
+                this.stats.failedScalps++;
+                return;
+            }
+
+            // Utiliser la quantité réellement remplie (peut être un fill partiel)
+            const filledShares = fillResult.fullyFilled ? shares : +fillResult.sizeMatched.toFixed(2);
+            if (filledShares < 1) {
+                log.warn(`Fill trop petit: ${filledShares} shares - skip sell`);
+                this.stats.failedScalps++;
+                return;
+            }
+
+            log.trade(`Buy filled: ${filledShares}/${shares} shares (${fillResult.status})`);
+
+            // === ÉTAPE 2: SELL à +0.01 avec la quantité réellement achetée ===
+            const sellShares = filledShares;
             const sellResult = await this.poly.placeOrder({
                 tokenId,
                 side: 'sell',

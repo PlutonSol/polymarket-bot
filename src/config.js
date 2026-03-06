@@ -10,6 +10,7 @@ const CONFIG = {
     // Wallet
     PRIVATE_KEY: process.env.PRIVATE_KEY || '',
     WALLET_ADDRESS: process.env.WALLET_ADDRESS || '',
+    PROXY_WALLET_ADDRESS: process.env.PROXY_WALLET_ADDRESS || '',
     POLY_API_KEY: process.env.POLY_API_KEY || '',
     POLY_API_SECRET: process.env.POLY_API_SECRET || '',
     POLY_API_PASSPHRASE: process.env.POLY_API_PASSPHRASE || '',
@@ -45,7 +46,9 @@ function validateConfig() {
     const errors = [];
     if (!CONFIG.DRY_RUN) {
         if (!CONFIG.PRIVATE_KEY) errors.push('PRIVATE_KEY requis pour le trading live');
-        if (!CONFIG.WALLET_ADDRESS) errors.push('WALLET_ADDRESS requis');
+        if (!CONFIG.WALLET_ADDRESS && !CONFIG.PROXY_WALLET_ADDRESS) {
+            errors.push('PROXY_WALLET_ADDRESS (ou WALLET_ADDRESS) requis - c\'est l\'adresse du proxy wallet Polymarket où sont vos fonds');
+        }
     }
     if (!CONFIG.OPENAI_API_KEY && !CONFIG.ANTHROPIC_API_KEY) {
         errors.push('OPENAI_API_KEY ou ANTHROPIC_API_KEY requis');
