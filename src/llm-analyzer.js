@@ -42,8 +42,7 @@ class LLMAnalyzer {
         });
 
         if (!res.ok) {
-            const errText = await res.text();
-            throw new Error(`OpenAI ${res.status}: ${errText}`);
+            throw new Error(`OpenAI API error ${res.status}`);
         }
 
         const data = await res.json();
@@ -69,8 +68,7 @@ class LLMAnalyzer {
         });
 
         if (!res.ok) {
-            const errText = await res.text();
-            throw new Error(`Anthropic ${res.status}: ${errText}`);
+            throw new Error(`Anthropic API error ${res.status}`);
         }
 
         const data = await res.json();

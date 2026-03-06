@@ -8,16 +8,16 @@ const TelegramController = require('./src/telegram-bot');
 async function main() {
     console.log(`
 ╔══════════════════════════════════════════════╗
-║   ⚡ Polymarket Scalping Bot v7.0            ║
+║   ⚡ Polymarket Scalping Bot v8              ║
 ║   Buy @ bid → Sell @ bid+${(CONFIG.SCALP_TICK * 100).toFixed(0)}c              ║
-║   Marchés >= $${(CONFIG.MIN_MARKET_VOLUME / 1e6).toFixed(0)}M volume uniquement       ║
+║   Marchés >= $${(CONFIG.MIN_MARKET_VOLUME / 1e6).toFixed(0)}M | spread <= ${CONFIG.MAX_SPREAD_CENTS}c       ║
 ║   LLM: ${CONFIG.LLM_PROVIDER.toUpperCase().padEnd(10)}                         ║
 ╚══════════════════════════════════════════════╝
 `);
 
     const errors = validateConfig();
     if (errors.length > 0) {
-        console.error('❌ Erreurs de configuration:');
+        console.error('Erreurs de configuration:');
         errors.forEach(e => console.error(`   - ${e}`));
         console.error('\nCopier .env.example vers .env et remplir les valeurs.');
         process.exit(1);
@@ -25,10 +25,9 @@ async function main() {
 
     log.info('Configuration OK');
     log.info(`Mode: ${CONFIG.DRY_RUN ? 'DRY RUN' : 'LIVE TRADING'}`);
-    log.info(`Stratégie: Buy @ best bid → Sell @ +${CONFIG.SCALP_TICK * 100}c`);
-    log.info(`Taille: $${CONFIG.TRADE_SIZE_USD} par scalp`);
+    log.info(`Stratégie: Buy @ best bid -> Sell @ +${CONFIG.SCALP_TICK * 100}c`);
+    log.info(`Max 20% wallet | Cycle ${CONFIG.SCALP_INTERVAL / 1000}s`);
     log.info(`Volume cible: $${CONFIG.DAILY_VOLUME_TARGET}/jour`);
-    log.info(`Min volume marché: $${(CONFIG.MIN_MARKET_VOLUME / 1e6).toFixed(0)}M`);
 
     const polyClient = new PolymarketClient();
     await polyClient.initialize();
@@ -39,22 +38,31 @@ async function main() {
 
     await telegram.initialize();
 
-    log.info('Bot prêt - en attente de commandes Telegram');
+    log.info('Bot prêt - /start pour démarrer');
 
     const shutdown = async (signal) => {
         log.info(`${signal} - arrêt...`);
         tradingEngine.stop();
-        await telegram.send('⚠️ Bot arrêté');
+        await telegram.send('Bot arrêté (signal système)');
         process.exit(0);
     };
 
     process.on('SIGINT', () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
-    process.on('uncaughtException', (e) => log.error('Uncaught:', e.message));
-    process.on('unhandledRejection', (e) => log.error('Unhandled:', e.message || e));
+
+    // Uncaught exception: log et exit - le process est dans un état indéfini
+    process.on('uncaughtException', (e) => {
+        log.error('Uncaught exception - arrêt du bot:', e.message);
+        tradingEngine.stop();
+        process.exit(1);
+    });
+
+    process.on('unhandledRejection', (e) => {
+        log.error('Unhandled rejection:', e?.message || String(e));
+    });
 }
 
 main().catch(e => {
-    console.error('❌ Fatal:', e);
+    console.error('Fatal:', e.message || e);
     process.exit(1);
 });

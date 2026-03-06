@@ -79,6 +79,15 @@ class TradingEngine {
             this.state.dailyProfit = 0;
             this.state.lastResetDate = today;
         }
+        // Nettoyer les activeScalps périmés (> SCALP_TIMEOUT)
+        const now = Date.now();
+        const before = this.state.activeScalps.length;
+        this.state.activeScalps = this.state.activeScalps.filter(s => {
+            const age = now - new Date(s.time).getTime();
+            return age < CONFIG.SCALP_TIMEOUT;
+        });
+        const cleaned = before - this.state.activeScalps.length;
+        if (cleaned > 0) log.warn(`${cleaned} scalps périmés nettoyés`);
     }
 
     /**
