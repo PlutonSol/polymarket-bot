@@ -14,19 +14,12 @@ const CONFIG = {
     POLY_API_SECRET: process.env.POLY_API_SECRET || '',
     POLY_API_PASSPHRASE: process.env.POLY_API_PASSPHRASE || '',
 
-    // LLM
-    LLM_PROVIDER: process.env.LLM_PROVIDER || 'openai',
-    OPENAI_API_KEY: process.env.OPENAI_API_KEY || '',
-    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
-    LLM_MODEL: process.env.LLM_MODEL || 'gpt-4o',
-
     // Telegram
     TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
     TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',
     TELEGRAM_USER_ID: process.env.TELEGRAM_USER_ID || '', // ID utilisateur Telegram pour auth renforcée
 
     // Scalping parameters
-    MIN_MARKET_VOLUME: parseFloat(process.env.MIN_MARKET_VOLUME || '1000000'),  // 1M minimum
     SCALP_TICK: parseFloat(process.env.SCALP_TICK || '0.01'),                   // +0.01 revente (1 tick = 1 cent)
     TRADE_SIZE_USD: parseFloat(process.env.TRADE_SIZE_USD || '50'),              // Taille par scalp en USD (fallback si pas de balance)
     MAX_TRADE_SIZE: parseFloat(process.env.MAX_TRADE_SIZE || '200'),             // Taille max par scalp
@@ -71,9 +64,6 @@ function validateConfig() {
             errors.push('PROXY_WALLET_ADDRESS (ou WALLET_ADDRESS) requis - c\'est l\'adresse du proxy wallet Polymarket où sont vos fonds');
         }
     }
-    if (!CONFIG.OPENAI_API_KEY && !CONFIG.ANTHROPIC_API_KEY) {
-        errors.push('OPENAI_API_KEY ou ANTHROPIC_API_KEY requis');
-    }
     if (!CONFIG.TELEGRAM_BOT_TOKEN) errors.push('TELEGRAM_BOT_TOKEN requis');
     if (!CONFIG.TELEGRAM_CHAT_ID) errors.push('TELEGRAM_CHAT_ID requis');
     if (CONFIG.MAX_WALLET_EXPOSURE > 1 || CONFIG.MAX_WALLET_EXPOSURE <= 0) {
@@ -84,7 +74,6 @@ function validateConfig() {
     }
     // Valider que les valeurs numériques sont finies et raisonnables
     const numericChecks = [
-        ['MIN_MARKET_VOLUME', 0, 1e12],
         ['TRADE_SIZE_USD', 1, 100000],
         ['MAX_TRADE_SIZE', 1, 100000],
         ['MIN_TRADE_SIZE', 0.1, 100000],

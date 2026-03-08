@@ -23,7 +23,7 @@ class RateLimiter {
     }
 }
 
-// Limites : 10 appels/s pour CLOB, 5/s pour Gamma, 3/s pour LLM
+// Limites : 10 appels/s pour CLOB, 5/s pour Gamma
 const clobLimiter = new RateLimiter(10, 1000);
 const gammaLimiter = new RateLimiter(5, 1000);
 
@@ -200,11 +200,49 @@ class PolymarketClient {
             return markets.filter(m => {
                 if (!m.clobTokenIds || m.clobTokenIds.length === 0 || !m.active) return false;
                 const vol = parseFloat(m.volume || m.volumeNum || 0);
-                return vol >= CONFIG.MIN_MARKET_VOLUME;
+                return vol >= 1_000_000;
             });
         } catch (error) {
             log.error('Erreur fetch marchés:', error.message);
             return [];
+        }
+    }
+
+    /**
+     * Récupère un marché spécifique par slug ou conditionId.
+     * Retourne le marché enrichi avec orderbook, prêt pour le scalping.
+     */
+    async getMarketByQuery(query) {
+        try {
+            await gammaLimiter.wait();
+
+            // Essayer d'abord par slug
+            let res = await fetch(`${CONFIG.GAMMA_HOST}/markets?slug=${encodeURIComponent(query)}&limit=1`);
+            if (res.ok) {
+                const markets = await res.json();
+                if (markets.length > 0) return markets[0];
+            }
+
+            // Sinon par conditionId
+            await gammaLimiter.wait();
+            res = await fetch(`${CONFIG.GAMMA_HOST}/markets?condition_id=${encodeURIComponent(query)}&limit=1`);
+            if (res.ok) {
+                const markets = await res.json();
+                if (markets.length > 0) return markets[0];
+            }
+
+            // Sinon recherche textuelle
+            await gammaLimiter.wait();
+            res = await fetch(`${CONFIG.GAMMA_HOST}/markets?search=${encodeURIComponent(query)}&limit=5&active=true&closed=false`);
+            if (res.ok) {
+                const markets = await res.json();
+                if (markets.length > 0) return markets[0];
+            }
+
+            return null;
+        } catch (error) {
+            log.error('Erreur recherche marché:', error.message);
+            return null;
         }
     }
 
@@ -215,7 +253,7 @@ class PolymarketClient {
         }
         marketsCache = await this.getHighVolumeMarkets();
         marketsCacheTime = now;
-        log.info(`Cache marchés: ${marketsCache.length} marchés >= $${(CONFIG.MIN_MARKET_VOLUME / 1e6).toFixed(0)}M volume`);
+        log.info(`Cache marchés: ${marketsCache.length} marchés >= $1M volume`);
         return marketsCache;
     }
 

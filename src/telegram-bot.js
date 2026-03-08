@@ -3,13 +3,12 @@ const { CONFIG } = require('./config');
 const log = require('./logger');
 
 /**
- * Bot Telegram - Interface minimaliste: /start, /off, récap auto
+ * Bot Telegram - /market pour définir le marché, /start et /off pour contrôler
  */
 class TelegramController {
-    constructor(tradingEngine, polyClient, llmAnalyzer) {
+    constructor(tradingEngine, polyClient) {
         this.engine = tradingEngine;
         this.poly = polyClient;
-        this.llm = llmAnalyzer;
         this.bot = null;
         this.recapInterval = null;
     }
@@ -22,11 +21,9 @@ class TelegramController {
             },
         });
 
-        // Gérer les erreurs de polling avec backoff pour éviter le flood de logs
         this._pollingErrors = 0;
         this.bot.on('polling_error', (error) => {
             this._pollingErrors++;
-            // Log seulement les premières erreurs, puis 1 sur 100
             if (this._pollingErrors <= 3 || this._pollingErrors % 100 === 0) {
                 log.error(`Telegram polling error (${this._pollingErrors}x): ${error.message}`);
             }
@@ -36,48 +33,81 @@ class TelegramController {
         this._scheduleDailyRecap();
         log.info('Telegram initialisé');
 
-        await this.send(`🤖 *Polymarket Scalping Bot v8*
+        await this.send(`*Polymarket Scalping Bot v9*
 
-💰 ${CONFIG.DRY_RUN ? '🧪 DRY RUN' : '🔴 LIVE'}
-📊 Buy @ bid → Sell @ bid+${CONFIG.SCALP_TICK * 100}c
-📈 Marchés >= $${(CONFIG.MIN_MARKET_VOLUME / 1e6).toFixed(0)}M | spread <= ${CONFIG.MAX_SPREAD_CENTS}c
-💳 Max 20% wallet | Cycle ${CONFIG.SCALP_INTERVAL / 1000}s
+${CONFIG.DRY_RUN ? 'DRY RUN' : 'LIVE'}
+Buy @ bid -> Sell @ bid+${CONFIG.SCALP_TICK * 100}c
+Spread max: ${CONFIG.MAX_SPREAD_CENTS}c | Cycle ${CONFIG.SCALP_INTERVAL / 1000}s
 
-/start - Démarrer
-/off - Arrêter`);
+/market <slug> - Definir le marche cible
+/start - Demarrer le scalping
+/off - Arreter`);
     }
 
     _auth(msg) {
         const chatOk = msg.chat.id.toString() === CONFIG.TELEGRAM_CHAT_ID;
-        // Vérifier aussi l'ID utilisateur si configuré (protection groupe)
         const userOk = !CONFIG.TELEGRAM_USER_ID || msg.from?.id?.toString() === CONFIG.TELEGRAM_USER_ID;
         const authorized = chatOk && userOk;
         if (!authorized) {
-            log.warn(`Accès non autorisé: chat_id=${msg.chat.id} user_id=${msg.from?.id} username=${msg.from?.username || 'unknown'}`);
+            log.warn(`Acces non autorise: chat_id=${msg.chat.id} user_id=${msg.from?.id} username=${msg.from?.username || 'unknown'}`);
         }
         return authorized;
     }
 
     _setupCommands() {
+        // /market <slug ou texte de recherche>
+        this.bot.onText(/\/market(?:\s+(.+))?/, async (msg, match) => {
+            if (!this._auth(msg)) return;
+
+            const query = match[1]?.trim();
+            if (!query) {
+                const current = this.engine.targetMarket;
+                if (current) {
+                    await this.send(`Marche actuel: ${current.question}\n\nUsage: /market <slug ou recherche>`);
+                } else {
+                    await this.send('Aucun marche defini.\n\nUsage: /market <slug ou recherche>');
+                }
+                return;
+            }
+
+            await this.send(`Recherche: "${query}"...`);
+
+            const market = await this.poly.getMarketByQuery(query);
+            if (!market) {
+                await this.send(`Aucun marche trouve pour: "${query}"`);
+                return;
+            }
+
+            const result = await this.engine.setTargetMarket(market);
+            const enriched = this.engine.targetMarket;
+
+            let info = `${result}\n`;
+            if (enriched) {
+                if (enriched.yesBook) {
+                    info += `\nYES: bid=${enriched.yesBook.bestBid} ask=${enriched.yesBook.bestAsk} spread=${enriched.yesBook.spreadCents}c depth=$${enriched.yesBook.bidDepthUsd?.toFixed(0)}`;
+                }
+                if (enriched.noBook) {
+                    info += `\nNO: bid=${enriched.noBook.bestBid} ask=${enriched.noBook.bestAsk} spread=${enriched.noBook.spreadCents}c depth=$${enriched.noBook.bidDepthUsd?.toFixed(0)}`;
+                }
+            }
+
+            await this.send(info);
+        });
+
         this.bot.onText(/\/start$/, async (msg) => {
             if (!this._auth(msg)) return;
             const result = await this.engine.start();
-            await this.send(`🟢 ${result}`);
+            await this.send(result);
         });
 
         this.bot.onText(/\/off/, async (msg) => {
             if (!this._auth(msg)) return;
             const result = this.engine.stop();
             const s = await this.engine.getStatus();
-            await this.send(`🔴 ${result}
-
-${this._formatRecap(s)}`);
+            await this.send(`${result}\n\n${this._formatRecap(s)}`);
         });
     }
 
-    /**
-     * Récap envoyé toutes les heures + à 21h (résumé journalier)
-     */
     _scheduleDailyRecap() {
         this.recapInterval = setInterval(async () => {
             if (!this.engine.isRunning) return;
@@ -87,7 +117,7 @@ ${this._formatRecap(s)}`);
 
             if (isDailyRecap) {
                 const s = await this.engine.getStatus();
-                await this.send(`📊 *Récap journalier*\n\n${this._formatRecap(s)}`);
+                await this.send(`*Recap journalier*\n\n${this._formatRecap(s)}`);
             } else if (isHourly) {
                 const s = await this.engine.getStatus();
                 await this.send(this._formatRecap(s));
@@ -98,15 +128,16 @@ ${this._formatRecap(s)}`);
     _formatRecap(s) {
         const bar = this._bar(parseFloat(s.dailyProgress));
         return `${bar} ${s.dailyProgress}%
-💰 Volume: $${s.dailyVolume.toFixed(0)} / $${s.dailyTarget}
-⚡ Scalps: ${s.dailyScalps} | Positions: ${s.activeScalps}
-💳 Wallet: $${s.walletBalance.toFixed(2)} USDC
-💵 Profit: $${s.dailyProfit.toFixed(4)}`;
+Marche: ${s.targetMarket}
+Volume: $${s.dailyVolume.toFixed(0)} / $${s.dailyTarget}
+Scalps: ${s.dailyScalps} | Positions: ${s.activeScalps}
+Wallet: $${s.walletBalance.toFixed(2)} USDC
+Profit: $${s.dailyProfit.toFixed(4)}`;
     }
 
     _bar(pct) {
         const f = Math.round(pct / 5);
-        return '▓'.repeat(Math.min(f, 20)) + '░'.repeat(20 - Math.min(f, 20));
+        return '|'.repeat(Math.min(f, 20)) + '.'.repeat(20 - Math.min(f, 20));
     }
 
     async send(message) {

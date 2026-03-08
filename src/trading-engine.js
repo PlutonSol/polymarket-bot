@@ -3,24 +3,25 @@ const log = require('./logger');
 
 /**
  * Moteur de scalping - Achète au best bid et revend immédiatement +0.01
- * Cible uniquement les marchés avec volume >= 1M et spread < 0.2c
- * Max 20% du wallet engagé par trade
+ * Fonctionne sur un marché unique fourni manuellement via /market
  */
 class TradingEngine {
-    constructor(polyClient, llmAnalyzer) {
+    constructor(polyClient) {
         this.poly = polyClient;
-        this.llm = llmAnalyzer;
         this.isRunning = false;
         this.loopTimeout = null;
-        this._scalpsLock = false; // Verrou pour éviter les race conditions sur activeScalps
+        this._scalpsLock = false;
+
+        // Marché cible (défini via setTargetMarket)
+        this.targetMarket = null;
 
         // État
         this.state = {
             dailyVolume: 0,
             dailyTrades: [],
-            dailyScalps: 0,        // Nombre de scalps complets (buy+sell)
-            dailyProfit: 0,        // Profit théorique des scalps
-            activeScalps: [],      // Scalps en cours (buy placé, en attente de sell)
+            dailyScalps: 0,
+            dailyProfit: 0,
+            activeScalps: [],
             lastResetDate: new Date().toDateString(),
             totalCycles: 0,
         };
@@ -28,18 +29,35 @@ class TradingEngine {
         this.stats = {
             totalScalps: 0,
             totalVolume: 0,
-            completedScalps: 0,    // Buy + Sell réussis
-            failedScalps: 0,       // Sell non exécuté
-            llmCalls: 0,
+            completedScalps: 0,
+            failedScalps: 0,
         };
+    }
+
+    /**
+     * Définit le marché cible pour le scalping.
+     * @param {object} market - Marché brut depuis l'API Gamma
+     * @returns {string} Message de confirmation
+     */
+    async setTargetMarket(market) {
+        const enriched = await this.poly.enrichForScalping(market);
+        if (!enriched) {
+            return `Impossible d'enrichir le marché: ${market.question || market.slug || 'inconnu'}`;
+        }
+
+        this.targetMarket = enriched;
+        this.poly.invalidateCache();
+        log.info(`Marché cible: ${enriched.question}`);
+        return `Marché cible défini: ${enriched.question}`;
     }
 
     async start() {
         if (this.isRunning) return 'Déjà en cours';
+        if (!this.targetMarket) return 'Aucun marché cible. Utilise /market <slug> d\'abord.';
         this.isRunning = true;
         log.info('Scalping démarré');
         this._runLoop();
-        return 'Scalping démarré';
+        return `Scalping démarré sur: ${this.targetMarket.question}`;
     }
 
     stop() {
@@ -91,7 +109,6 @@ class TradingEngine {
             this.state.dailyProfit = 0;
             this.state.lastResetDate = today;
         }
-        // Nettoyer les activeScalps périmés (> SCALP_TIMEOUT)
         await this._acquireScalpsLock();
         try {
             const now = Date.now();
@@ -108,14 +125,12 @@ class TradingEngine {
     }
 
     /**
-     * Cycle de scalping principal:
-     * 1. Récupérer marchés >= 1M volume
-     * 2. Enrichir avec orderbook
-     * 3. LLM sélectionne les meilleurs targets
-     * 4. Exécuter les scalps (buy + sell immédiat à +0.01)
+     * Cycle de scalping:
+     * 1. Rafraîchir l'orderbook du marché cible
+     * 2. Sélectionner le meilleur token (Yes/No) automatiquement
+     * 3. Exécuter le scalp (buy + sell à +0.01)
      */
     async _executeScalpCycle() {
-        // Stop-loss global: arrêter si les pertes dépassent le seuil
         if (this.state.dailyProfit < -CONFIG.MAX_DAILY_LOSS) {
             log.error(`STOP-LOSS: perte journalière $${Math.abs(this.state.dailyProfit).toFixed(2)} > max $${CONFIG.MAX_DAILY_LOSS}`);
             this.stop();
@@ -127,137 +142,57 @@ class TradingEngine {
             return;
         }
 
+        if (!this.targetMarket) {
+            log.warn('Aucun marché cible défini');
+            return;
+        }
+
         log.info(`=== Cycle #${this.state.totalCycles + 1} | Vol: $${this.state.dailyVolume.toFixed(0)}/$${CONFIG.DAILY_VOLUME_TARGET} | Scalps: ${this.state.dailyScalps} ===`);
 
-        // 1. Récupérer marchés à gros volume
-        const markets = await this.poly.getCachedHighVolumeMarkets();
-        if (markets.length === 0) {
-            log.warn('Aucun marché >= $1M trouvé');
-            return;
+        // 1. Rafraîchir les orderbooks du marché cible
+        const m = this.targetMarket;
+        const [yesBook, noBook] = await Promise.all([
+            m.yesTokenId ? this.poly.analyzeBookForScalp(m.yesTokenId) : null,
+            m.noTokenId ? this.poly.analyzeBookForScalp(m.noTokenId) : null,
+        ]);
+
+        // 2. Choisir le meilleur token automatiquement
+        const candidates = [];
+        if (yesBook && yesBook.spreadCents > 0 && yesBook.spreadCents <= CONFIG.MAX_SPREAD_CENTS
+            && yesBook.bidDepthUsd >= CONFIG.MIN_BOOK_DEPTH_USD && yesBook.askDepthUsd >= CONFIG.MIN_BOOK_DEPTH_USD) {
+            candidates.push({ token: 'yes', tokenId: m.yesTokenId, book: yesBook });
         }
-        log.info(`${markets.length} marchés >= $1M volume`);
-
-        // 2. Enrichir avec orderbooks (max 8 en parallèle)
-        const toEnrich = markets.slice(0, 8);
-        const enriched = (await Promise.all(
-            toEnrich.map(m => this.poly.enrichForScalping(m).catch(() => null))
-        )).filter(Boolean);
-
-        if (enriched.length === 0) {
-            log.warn('Aucun orderbook disponible');
-            return;
+        if (noBook && noBook.spreadCents > 0 && noBook.spreadCents <= CONFIG.MAX_SPREAD_CENTS
+            && noBook.bidDepthUsd >= CONFIG.MIN_BOOK_DEPTH_USD && noBook.askDepthUsd >= CONFIG.MIN_BOOK_DEPTH_USD) {
+            candidates.push({ token: 'no', tokenId: m.noTokenId, book: noBook });
         }
 
-        // Pre-filtrer: garder seulement ceux avec spread <= MAX_SPREAD_CENTS (0.2c)
-        // On veut des marchés ultra-liquides avec un spread très serré
-        const viable = enriched.filter(m => {
-            const yesOk = m.yesBook && m.yesBook.spreadCents > 0 && m.yesBook.spreadCents <= CONFIG.MAX_SPREAD_CENTS;
-            const noOk = m.noBook && m.noBook.spreadCents > 0 && m.noBook.spreadCents <= CONFIG.MAX_SPREAD_CENTS;
-            return yesOk || noOk;
-        });
-
-        if (viable.length === 0) {
-            log.info(`Aucun marché avec spread <= ${CONFIG.MAX_SPREAD_CENTS}c`);
+        if (candidates.length === 0) {
+            log.info(`Pas de token scalable (spread > ${CONFIG.MAX_SPREAD_CENTS}c ou liquidité insuffisante)`);
             return;
         }
 
-        log.info(`${viable.length} marchés avec spread <= ${CONFIG.MAX_SPREAD_CENTS}c`);
+        // Trier par meilleur bidDepth (plus de liquidité = meilleur pour scalper)
+        candidates.sort((a, b) => b.book.bidDepthUsd - a.book.bidDepthUsd);
+        const best = candidates[0];
 
-        // 3. LLM sélectionne les meilleurs targets
-        this.stats.llmCalls++;
-        const { targets, skipped } = await this.llm.selectScalpTargets(viable);
+        const target = {
+            tokenId: best.tokenId,
+            buyPrice: best.book.bestBid,
+            sellPrice: +(best.book.bestBid + CONFIG.SCALP_TICK).toFixed(2),
+            sizeUsd: CONFIG.TRADE_SIZE_USD,
+            market: `${m.question} (${best.token.toUpperCase()})`,
+        };
 
-        if (targets.length === 0) {
-            log.info('LLM: aucun target viable');
-            if (skipped.length > 0) log.info('Skip:', skipped.join(' | '));
-            return;
-        }
+        log.info(`Target: ${best.token.toUpperCase()} | Bid: ${best.book.bestBid} | Spread: ${best.book.spreadCents}c | Depth: $${best.book.bidDepthUsd.toFixed(0)}`);
 
-        log.info(`${targets.length} targets sélectionnés par LLM`);
-
-        // 4. Valider les targets LLM contre les données réelles (anti-injection)
-        const validatedTargets = this._validateLLMTargets(targets, viable);
-
-        if (validatedTargets.length === 0) {
-            log.warn('Aucun target LLM validé contre les données réelles');
-            return;
-        }
-
-        if (validatedTargets.length < targets.length) {
-            log.warn(`${targets.length - validatedTargets.length} targets LLM rejetés (tokenId/prix invalides)`);
-        }
-
-        // 5. Exécuter les scalps
-        const maxScalps = Math.min(validatedTargets.length, CONFIG.MAX_CONCURRENT_SCALPS);
-        for (let i = 0; i < maxScalps; i++) {
-            if (!this.isRunning) break;
-            if (this.state.dailyVolume >= CONFIG.DAILY_VOLUME_TARGET) break;
-
-            const target = validatedTargets[i];
-            await this._executeScalp(target);
-
-            // Petite pause entre scalps
-            if (i < maxScalps - 1) {
-                await new Promise(r => setTimeout(r, 1500));
-            }
-        }
+        // 3. Exécuter le scalp
+        await this._executeScalp(target);
     }
 
-    /**
-     * Valide que les targets du LLM correspondent aux données réelles des marchés.
-     * Empêche le LLM de retourner des tokenIds ou prix arbitraires (injection).
-     */
-    _validateLLMTargets(targets, enrichedMarkets) {
-        // Construire un set de tous les tokenIds et books connus
-        const knownTokens = new Map();
-        for (const m of enrichedMarkets) {
-            if (m.yesTokenId && m.yesBook) {
-                knownTokens.set(m.yesTokenId, { book: m.yesBook, market: m.question });
-            }
-            if (m.noTokenId && m.noBook) {
-                knownTokens.set(m.noTokenId, { book: m.noBook, market: m.question });
-            }
-        }
-
-        return targets.filter(t => {
-            // 1. Le tokenId doit exister dans nos données
-            if (!knownTokens.has(t.tokenId)) {
-                log.warn(`LLM target rejeté: tokenId ${t.tokenId} inconnu`);
-                return false;
-            }
-
-            const { book } = knownTokens.get(t.tokenId);
-
-            // 2. Le buyPrice doit être proche du bestBid réel (tolérance 2 cents)
-            if (Math.abs(t.buyPrice - book.bestBid) > 0.02) {
-                log.warn(`LLM target rejeté: buyPrice ${t.buyPrice} trop loin du bestBid réel ${book.bestBid}`);
-                return false;
-            }
-
-            // 3. Le prix doit être entre 0.01 et 0.99 (marché de prédiction)
-            if (t.buyPrice < 0.01 || t.buyPrice > 0.99 || t.sellPrice < 0.01 || t.sellPrice > 0.99) {
-                log.warn(`LLM target rejeté: prix hors bornes buy=${t.buyPrice} sell=${t.sellPrice}`);
-                return false;
-            }
-
-            // 4. La taille ne doit pas dépasser MAX_TRADE_SIZE
-            if (t.sizeUsd && t.sizeUsd > CONFIG.MAX_TRADE_SIZE) {
-                log.warn(`LLM target corrigé: sizeUsd ${t.sizeUsd} > max ${CONFIG.MAX_TRADE_SIZE}`);
-                t.sizeUsd = CONFIG.MAX_TRADE_SIZE;
-            }
-
-            return true;
-        });
-    }
-
-    /**
-     * Exécute un scalp complet: BUY au bestBid puis SELL à bestBid + 0.01
-     * La taille est limitée à 20% du wallet
-     */
     async _executeScalp(target) {
         const { tokenId, buyPrice, sellPrice, sizeUsd, market } = target;
 
-        // Validation
         if (!tokenId || !buyPrice || !sellPrice) {
             log.warn('Target invalide:', target);
             return;
@@ -269,7 +204,6 @@ class TradingEngine {
             return;
         }
 
-        // Calculer la taille max basée sur 20% du wallet
         const maxFromWallet = await this.poly.getMaxTradeSize();
         if (maxFromWallet < CONFIG.MIN_TRADE_SIZE) {
             log.warn(`Wallet trop faible: max trade=$${maxFromWallet.toFixed(2)} (20% du wallet)`);
@@ -281,37 +215,40 @@ class TradingEngine {
         const shares = +(size / buyPrice).toFixed(2);
 
         log.trade(`Wallet 20% cap: $${maxFromWallet.toFixed(2)} | Taille effective: $${size.toFixed(2)}`);
-
         log.trade(`--- SCALP: ${market || 'N/A'} ---`);
         log.trade(`BUY ${shares} shares @ ${buyPrice} ($${size.toFixed(2)})`);
         log.trade(`SELL cible: ${shares} shares @ ${sellPrice} (+${priceDiff * 100}c)`);
 
         // Re-vérifier l'orderbook juste avant d'exécuter
         const freshBook = await this.poly.analyzeBookForScalp(tokenId);
-        const check = await this.llm.quickBookCheck(freshBook, market);
-        if (!check.ok) {
-            log.warn(`Scalp annulé (book changé): ${check.reason}`);
+        if (!freshBook) {
+            log.warn('Scalp annulé: orderbook indisponible');
+            return;
+        }
+        if (freshBook.spreadCents <= 0) {
+            log.warn('Scalp annulé: spread nul');
+            return;
+        }
+        if (freshBook.spreadCents > CONFIG.MAX_SPREAD_CENTS) {
+            log.warn(`Scalp annulé: spread ${freshBook.spreadCents}c > max ${CONFIG.MAX_SPREAD_CENTS}c`);
+            return;
+        }
+        if (freshBook.bidDepthUsd < CONFIG.MIN_BOOK_DEPTH_USD) {
+            log.warn(`Scalp annulé: bid depth faible $${freshBook.bidDepthUsd.toFixed(0)}`);
             return;
         }
 
         // Ajuster le prix si le book a bougé
         let finalBuyPrice = buyPrice;
         let finalSellPrice = sellPrice;
-        if (freshBook && freshBook.bestBid !== buyPrice) {
+        if (freshBook.bestBid !== buyPrice) {
             finalBuyPrice = freshBook.bestBid;
             finalSellPrice = +(freshBook.bestBid + CONFIG.SCALP_TICK).toFixed(2);
             log.trade(`Prix ajusté: buy=${finalBuyPrice} sell=${finalSellPrice}`);
         }
 
-        // Vérifier que le sell sera dans le spread ou au ask
-        if (freshBook && finalSellPrice > freshBook.bestAsk) {
+        if (finalSellPrice > freshBook.bestAsk) {
             log.warn(`Sell ${finalSellPrice} > bestAsk ${freshBook.bestAsk} - skip`);
-            return;
-        }
-
-        // Vérifier que le spread est toujours <= MAX_SPREAD_CENTS
-        if (freshBook && freshBook.spreadCents > CONFIG.MAX_SPREAD_CENTS) {
-            log.warn(`Spread ${freshBook.spreadCents}c > max ${CONFIG.MAX_SPREAD_CENTS}c - skip`);
             return;
         }
 
@@ -346,12 +283,10 @@ class TradingEngine {
 
             log.trade(`BUY OK: ${buyResult.id} | Vol: +$${buyVolume.toFixed(2)}`);
 
-            // === Vérification du fill avant de vendre ===
-            // Attendre que le buy soit rempli (max 10s, polling toutes les 1s)
+            // === Vérification du fill ===
             const fillResult = await this.poly.waitForFill(buyResult.id, 10000, 1000);
 
             if (!fillResult.filled) {
-                // Buy non rempli -> annuler et abandonner
                 log.warn(`Buy non rempli après 10s (status: ${fillResult.status}) - annulation`);
                 try {
                     await this.poly.cancelOrder(buyResult.id);
@@ -363,7 +298,6 @@ class TradingEngine {
                 return;
             }
 
-            // Utiliser la quantité réellement remplie (peut être un fill partiel)
             const filledShares = fillResult.fullyFilled ? shares : +fillResult.sizeMatched.toFixed(2);
             if (filledShares < 1) {
                 log.warn(`Fill trop petit: ${filledShares} shares - skip sell`);
@@ -373,7 +307,7 @@ class TradingEngine {
 
             log.trade(`Buy filled: ${filledShares}/${shares} shares (${fillResult.status})`);
 
-            // === ÉTAPE 2: SELL à +0.01 avec la quantité réellement achetée ===
+            // === ÉTAPE 2: SELL à +0.01 ===
             const sellShares = filledShares;
             const sellResult = await this.poly.placeOrder({
                 tokenId,
@@ -416,7 +350,6 @@ class TradingEngine {
             });
             this.stats.totalVolume += sellVolume;
 
-            // Profit du scalp
             const profit = (finalSellPrice - finalBuyPrice) * shares;
             this.state.dailyProfit += profit;
             this.state.dailyScalps++;
@@ -432,9 +365,6 @@ class TradingEngine {
         }
     }
 
-    /**
-     * Retente de vendre les positions ouvertes (scalps incomplets)
-     */
     async retryFailedScalps() {
         const active = [...this.state.activeScalps];
         if (active.length === 0) return 'Aucun scalp en attente';
@@ -466,6 +396,7 @@ class TradingEngine {
         return {
             isRunning: this.isRunning,
             mode: CONFIG.DRY_RUN ? 'DRY RUN' : 'LIVE',
+            targetMarket: this.targetMarket?.question || 'Aucun',
             dailyVolume: this.state.dailyVolume,
             dailyTarget: CONFIG.DAILY_VOLUME_TARGET,
             dailyProgress: ((this.state.dailyVolume / CONFIG.DAILY_VOLUME_TARGET) * 100).toFixed(1),
@@ -475,7 +406,6 @@ class TradingEngine {
             totalCycles: this.state.totalCycles,
             scalpTick: CONFIG.SCALP_TICK,
             tradeSize: CONFIG.TRADE_SIZE_USD,
-            minVolume: CONFIG.MIN_MARKET_VOLUME,
             maxSpread: CONFIG.MAX_SPREAD_CENTS,
             walletBalance,
             maxTradeSize,
